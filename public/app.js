@@ -154,6 +154,7 @@ async function checaNotifs() {
   if (recarregou) render();
   else { const w = $('.sino-w'); if (w) w.replaceWith(sino()); }
   if (novas.length && S.tela === 'conciliacao' && typeof concNovos === 'function') concNovos();
+  if (novas.length && S.tela === 'extrato' && S.banco === 'stone' && S.stoneVista !== 'conta' && typeof svCarrega === 'function') svCarrega();
 }
 setInterval(() => { if (!document.hidden) checaNotifs(); }, 60e3);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) checaNotifs(); });
@@ -215,6 +216,7 @@ function categorias(rows) {
 
 /* ---------- extrato: tela ---------- */
 function telaExtrato() {
+  if (S.banco === 'stone' && S.stoneVista !== 'conta') return telaStoneVendas();
   const wrap = h('div', { class: 'body' });
   if (!S.ext) {
     wrap.append(h('div', { class: 'loading' }, 'Carregando extrato…'));
@@ -228,7 +230,10 @@ function telaExtrato() {
   wrap.append(h('div', { class: 'bar' },
     h('div', { class: 'chips', role: 'group', 'aria-label': 'Conta' }, h('span', { class: 'lbl' }, 'Conta'),
       Object.keys(BANCO_TXT).map((b) => h('button', { type: 'button', 'aria-pressed': String(S.banco === b),
-        onclick: () => { if (S.banco === b) return; S.banco = b; localStorage.setItem('fin_banco', b); S.ext = null; render(); } }, BANCO_TXT[b]))),
+        onclick: () => { if (S.banco === b) return; S.banco = b; localStorage.setItem('fin_banco', b); S.ext = null; render(); } }, BANCO_TXT[b])),
+      S.banco === 'stone' ? h('div', { class: 'seg', role: 'group', 'aria-label': 'O que ver', style: 'margin-left:8px' },
+        h('button', { type: 'button', 'aria-pressed': 'false', onclick: () => { S.stoneVista = 'vendas'; render(); } }, 'Vendas (maquininha e link)'),
+        h('button', { type: 'button', 'aria-pressed': 'true' }, 'Extrato da conta')) : null),
     rows.length ? h('div', { class: 'chips' },
       S.me.role === 'admin' ? h('button', { type: 'button', class: 'btn sec small', onclick: (ev) => sincronizar(ev.currentTarget, 90) }, 'Sincronizar') : null,
       h('div', { class: 'seg', role: 'group', 'aria-label': 'Período' },

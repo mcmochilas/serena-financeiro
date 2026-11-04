@@ -65,9 +65,13 @@ export function avaliar(p: Pedido, l: Lanc, margem: number): Candidato | null {
   const nome = simNome(p.cliente, pag);
   const dias = diasEntre(p.data, l.data);
   const dentro = ad <= margem + 0.001;
-  if (!dentro && nome < 0.5) return null;
+  // número da pré-venda escrito no pagamento (descrição do link, mensagem do PIX): sinal mais forte que o valor
+  const num = String(p.num || p.id.replace(/\D/g, ""));
+  const comNum = num.length >= 4 && new RegExp(`(^|[^\\d])${num}([^\\d]|$)`).test(l.descricao || "");
+  if (!dentro && nome < 0.5 && !comNum) return null;
   const motivos: string[] = [];
   let pts = 0;
+  if (comNum) { pts += 55; motivos.push(`Nº ${num} no pagamento`); }
   if (ad < 0.005) { pts += 60; motivos.push("Valor exato"); }
   else if (dentro) { pts += 5 + 45 * (1 - ad / Math.max(margem, 0.01)); motivos.push(diff < 0 ? `Pagou ${brl(ad)} a menos` : `Pagou ${brl(ad)} a mais`); }
   else motivos.push(diff < 0 ? `Valor ${brl(ad)} abaixo` : `Valor ${brl(ad)} acima`);

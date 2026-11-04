@@ -112,3 +112,40 @@ export function lerArquivo(xml: string, stonecode: string) {
   const ativas = vendas.filter((v) => v.categoria === "Vendas no cartão");
   return { referencia: ref, vendas, cancelamentos, total: r2(ativas.reduce((s, v) => s + v.valor, 0)), qtd: ativas.length };
 }
+
+// ---------- Links de pagamento da Conta Stone (Stone Banking API) ----------
+export type Link = { id: string; code: string | null; criado: string | null; atualizado: string | null; valor: number; status: string; descricao: string; cliente: string; metodo: string; raw: unknown };
+// Pedido de link (GET /api/v1/payment_links/{conta}/orders) -> linha de fin_stone_links. Valores vêm em centavos.
+export function linkDePedido(o: any): Link | null {
+  if (!o?.id) return null;
+  const itens: any[] = Array.isArray(o.items) ? o.items : [];
+  const desc = [...new Set(itens.map((i) => String(i.description || i.name || "").trim()).filter(Boolean))].join(" / ") || String(o.description || o.name || "").trim();
+  const pag: any = (Array.isArray(o.charges) && o.charges[0]) || (Array.isArray(o.payments) && o.payments[0]) || {};
+  return {
+    id: String(o.id), code: o.code ? String(o.code) : null, criado: o.created_at || null, atualizado: o.updated_at || pag.paid_at || null,
+    valor: r2((Number(o.amount ?? itens.reduce((s, i) => s + Number(i.amount || 0) * Number(i.quantity || 1), 0)) || 0) / 100),
+    status: String(o.status || ""), descricao: desc, cliente: String(o.customer?.name || pag.customer?.name || "").trim(),
+    metodo: String(pag.payment_method || pag.last_transaction?.transaction_type || "").toLowerCase(), raw: o,
+  };
+}
+// Venda do arquivo da Stone feita por link (e-commerce) ou na maquininha
+export const ehLink = (raw: any) => /^pl_/.test(String(raw?.pedido || "")) || /^ch_/.test(String(raw?.itk || "")) || String(raw?.poi || "") === "4";
+const diaDe = (iso: string | null) => String(iso || "").slice(0, 10);
+const diasEntre = (a: string, b: string) => Math.abs(Date.parse(a + "T12:00:00Z") - Date.parse(b + "T12:00:00Z")) / 864e5;
+// Liga cada venda por link ao pedido do link: pelo código pl_/ch_ quando o pedido o traz; senão, por valor igual e data próxima.
+export function ligaLinks(vendas: { id: string; data: string; valor: number; raw: any }[], links: Link[]) {
+  const usados = new Set<string>(), m = new Map<string, Link>();
+  const pagos = links.filter((l) => !/cancel|expir|fail/i.test(l.status));
+  for (const v of vendas) {
+    const cods = [v.raw?.pedido, v.raw?.itk].filter((c) => c && /^(pl|ch)_/.test(String(c)));
+    const l = cods.length ? pagos.find((l) => !usados.has(l.id) && cods.some((c) => JSON.stringify(l.raw || "").includes(String(c)))) : undefined;
+    if (l) { m.set(v.id, l); usados.add(l.id); }
+  }
+  for (const v of vendas) {
+    if (m.has(v.id) || !ehLink(v.raw)) continue;
+    const l = pagos.filter((l) => !usados.has(l.id) && Math.abs(l.valor - v.valor) < 0.015 && diasEntre(diaDe(l.atualizado || l.criado), v.data) <= 3)
+      .sort((a, b) => diasEntre(diaDe(a.atualizado || a.criado), v.data) - diasEntre(diaDe(b.atualizado || b.criado), v.data))[0];
+    if (l) { m.set(v.id, l); usados.add(l.id); }
+  }
+  return m;
+}

@@ -2,7 +2,7 @@
 // Publicada sem verificação de JWT: a autenticação é feita aqui, por token de sessão (x-fin-token).
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { candidatos, ehRecebimentoDeCliente, pagador, JANELA, type Pedido } from "./conc.ts";
-import { baixarArquivo, lerArquivo } from "./stone_vendas.ts";
+import { baixarArquivo, lerArquivo, linkDePedido, ligaLinks, ehLink, type Link } from "./stone_vendas.ts";
 
 const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
 const CORS = {
@@ -338,6 +338,35 @@ async function buscaBanco(banco: string, dias: number): Promise<{ conta: string;
 }
 
 
+// Links de pagamento da Conta Stone: descrição e cliente preenchidos ao criar o link (onde costuma ir o nº da pré-venda)
+async function atualizaLinks(dias: number) {
+  const cr = await stoneCred();
+  const tok = await stoneToken(cr);
+  const ct = await stoneConta(cr, tok);
+  const desde = somaDias(agoraBR().toISOString().slice(0, 10), -dias);
+  const todos: Link[] = []; let after = "";
+  for (let p = 0; p < 40; p++) {
+    const qs = new URLSearchParams({ limit: "100" });
+    if (after) qs.set("after", after);
+    const j = await stoneGet(cr, tok, `/api/v1/payment_links/${ct.id}/orders?${qs}`);
+    const d: any[] = Array.isArray(j?.data) ? j.data : [];
+    todos.push(...(d.map(linkDePedido).filter(Boolean) as Link[]));
+    const prox = j?.cursor?.after;
+    if (!d.length || !prox || prox === after || d.every((o) => String(o.created_at || "9999").slice(0, 10) < desde)) break;
+    after = prox;
+  }
+  const rows = todos.map((l) => ({ ...l, visto: new Date().toISOString() }));
+  for (let i = 0; i < rows.length; i += 300) await q(db.from("fin_stone_links").upsert(rows.slice(i, i + 300)));
+  return rows.length;
+}
+// Pedidos de link num intervalo de datas (com folga), para ligar às vendas do arquivo da Stone
+async function linksEntre(de: string, ate: string) {
+  return (await q(db.from("fin_stone_links").select("id,code,criado,atualizado,valor,status,descricao,cliente,metodo,raw")
+    .gte("criado", somaDias(de, -40) + "T00:00:00Z").lte("criado", somaDias(ate, 2) + "T23:59:59Z").limit(5000)))
+    .map((l: any) => ({ ...l, valor: Number(l.valor) })) as Link[];
+}
+const horaDe = (desc: string) => (String(desc || "").match(/\b(\d{2}:\d{2})\b/) || [])[1] || "";
+
 // ---------- Stone: vendas no cartão (API de Conciliação, arquivo diário) ----------
 async function stoneVendasCred() {
   const c = await q(db.from("fin_credenciais").select("conta").eq("banco", "stone_vendas").single());
@@ -480,7 +509,10 @@ async function rotina() {
   const res: Record<string, unknown> = {};
   for (const c of await credenciais()) {
     if (!c.completo) { res[c.banco] = "não configurado"; continue; }
-    try { res[c.banco] = c.banco === "stone_vendas" ? await rotinaStoneVendas() : await rotinaBanco(c.banco); }
+    try {
+      res[c.banco] = c.banco === "stone_vendas" ? await rotinaStoneVendas() : await rotinaBanco(c.banco);
+      if (c.banco === "stone") { try { res.stone_links = await atualizaLinks(10); } catch (e) { res.stone_links = { erro: e instanceof Error ? e.message : String(e) }; } }
+    }
     catch (e) {
       const m = e instanceof Error ? e.message : String(e);
       await log("auto", `Atualização automática (${NOME[c.banco]}) falhou: ${m}`);
@@ -506,6 +538,18 @@ async function recebimentosLivres(de: string, ate: string, extraIds: string[] = 
     rows.push(...pg); if (pg.length < 1000) break;
   }
   const lanc = rows.map((r) => ({ ...r, valor: Number(r.valor), data: String(r.data) })).filter(ehRecebimentoDeCliente);
+  // vendas no cartão da Stone: mostra se foi maquininha ou link e, quando houver, a descrição e o cliente do link
+  const stv = lanc.filter((l) => l.banco === "stone_vendas");
+  if (stv.length) {
+    const extras = await emLotes(stv.map((l) => l.id), (ids) => q(db.from("fin_lancamentos").select("id,pedido:raw->>pedido,itk:raw->>itk,poi:raw->>poi").in("id", ids)));
+    const rawDe = new Map(extras.map((x: any) => [x.id, x]));
+    const vendas = stv.map((l) => ({ id: l.id, data: l.data, valor: l.valor, raw: rawDe.get(l.id) || {} }));
+    const lig = ligaLinks(vendas, await linksEntre(de, ate));
+    for (const l of stv) {
+      const lk = lig.get(l.id), link = ehLink(rawDe.get(l.id));
+      l.descricao = lk ? `LINK: ${lk.descricao || "sem descrição"} · ${l.descricao}${lk.cliente ? " · REM: " + lk.cliente : ""}` : `${link ? "LINK DE PAGAMENTO" : "MAQUININHA"} · ${l.descricao}`;
+    }
+  }
   const usados = new Set((await emLotes(lanc.map((l) => l.id), (l) => q(db.from("fin_conc_itens").select("ref").eq("tipo", "lancamento").in("ref", l)))).map((x: any) => x.ref));
   return lanc.filter((l) => !usados.has(l.id) || extraIds.includes(l.id));
 }
@@ -665,6 +709,8 @@ Deno.serve(async (req) => {
           try {
             const x = await buscaBanco("stone", 6);
             ok = true; msg = `Conexão OK: ${x.info}. Saldo disponível ${brl(x.saldo?.total || 0).replace("+", "")}. Extrato dos últimos 7 dias: ${x.rows.length} lançamentos.`;
+            try { msg += ` Links de pagamento: ${await atualizaLinks(90)} nos últimos 90 dias.`; }
+            catch (e) { msg += ` Links de pagamento não liberados: ${e instanceof Error ? e.message : e}`; }
           } catch (e) { ok = false; msg = e instanceof Error ? e.message : String(e); }
         }
         await log(me.login, `Teste ${banco}: ${msg}`);
@@ -708,11 +754,59 @@ Deno.serve(async (req) => {
           return out({ ok: true, n: x.vendas, faltam: x.faltam, processados: x.processados, erro: x.erro });
         }
         const x = await buscaBanco(banco, dias - 1);
+        if (banco === "stone") { try { await atualizaLinks(dias); } catch (_) { /* links são um extra: o extrato segue */ } }
         if (x.saldo) await gravaSaldo(banco, x.conta, x.saldo);
         for (let i = 0; i < x.rows.length; i += 500) await q(db.from("fin_lancamentos").upsert(x.rows.slice(i, i + 500)));
         await q(db.from("fin_credenciais").update({ teste_em: new Date().toISOString(), teste_ok: true, teste_msg: `Sincronizado: ${x.rows.length} lançamentos dos últimos ${dias} dias.` }).eq("banco", banco));
         await log(me.login, `${me.nome} sincronizou o extrato ${NOME[banco]}: ${x.rows.length} lançamentos (${dias} dias)`);
         return out({ ok: true, n: x.rows.length, dias, saldo: x.saldo?.total ?? null, saldo_erro: x.saldo_erro || null });
+      }
+
+      case "stone_vendas_lista": {
+        const hoje = agoraBR().toISOString().slice(0, 10);
+        const ate = isoDia(b.ate, hoje), de = isoDia(b.de, somaDias(ate, -29));
+        const rows: any[] = [];
+        for (let i = 0; i < 20000; i += 1000) {
+          const pg = await q(db.from("fin_lancamentos").select("id,conta,data,descricao,categoria,valor,documento,ordem,raw").eq("banco", "stone_vendas")
+            .gte("data", de).lte("data", ate).order("data", { ascending: false }).order("ordem", { ascending: false }).range(i, i + 999));
+          rows.push(...pg); if (pg.length < 1000) break;
+        }
+        const vendas = rows.map((r) => ({ ...r, valor: Number(r.valor), data: String(r.data) }));
+        const links = await linksEntre(de, ate);
+        const lig = ligaLinks(vendas, links);
+        // pré-venda(s) conciliada(s) com cada venda
+        const ci = vendas.length ? await emLotes(vendas.map((v) => v.id), (l) => q(db.from("fin_conc_itens").select("ref,conc_id").eq("tipo", "lancamento").in("ref", l))) : [];
+        const concIds = [...new Set(ci.map((x: any) => x.conc_id))];
+        const peds = concIds.length ? await q(db.from("fin_conc_itens").select("ref,conc_id").eq("tipo", "pedido").in("conc_id", concIds)) : [];
+        const pvsDe = new Map<number, string[]>();
+        for (const p of peds) pvsDe.set(p.conc_id, [...(pvsDe.get(p.conc_id) || []), p.ref]);
+        const concDe = new Map(ci.map((x: any) => [x.ref, x.conc_id]));
+        const itens = vendas.map((v) => {
+          const raw = v.raw || {}, lk = lig.get(v.id), cancelada = v.categoria === "Cartão cancelado";
+          const pvTexto = lk ? (String(lk.descricao).match(/(?:PV|PRE[\s-]?VENDA|PEDIDO)?\s*[-#nº:]*\s*(\d{5})\b/i) || [])[1] || null : null;
+          return {
+            id: v.id, data: v.data, hora: horaDe(v.descricao), stonecode: v.conta, origem: ehLink(raw) ? "link" : "maquininha",
+            valor: v.valor, liquido: Number(raw.liquido) || null, cancelada, cancelado: Number(raw.cancelado) || 0,
+            tipo_conta: raw.tipo_conta || "", bandeira: raw.bandeira || "", parcelas: Number(raw.parcelas) || 1, cartao: raw.cartao || "",
+            link_id: raw.pedido || null, cobranca: raw.itk && /^ch_/.test(raw.itk) ? raw.itk : null,
+            link: lk ? { descricao: lk.descricao, cliente: lk.cliente, code: lk.code, status: lk.status, metodo: lk.metodo } : null, pv_no_link: pvTexto,
+            pvs: concDe.has(v.id) ? pvsDe.get(concDe.get(v.id) as number) || [] : [],
+            previsao: Array.isArray(raw.previsao) ? raw.previsao : [],
+          };
+        });
+        const ativas = itens.filter((x) => !x.cancelada);
+        const soma = (a: any[], k: string) => r2(a.reduce((s, x) => s + (Number(x[k]) || 0), 0));
+        const cred = (await credenciais());
+        const ultimo = (await q(db.from("fin_stone_arquivos").select("data").eq("ok", true).order("data", { ascending: false }).limit(1)))[0]?.data || null;
+        return out({
+          de, ate, itens,
+          resumo: { qtd: ativas.length, bruto: soma(ativas, "valor"), liquido: soma(ativas, "liquido"),
+            maq: { qtd: ativas.filter((x) => x.origem === "maquininha").length, bruto: soma(ativas.filter((x) => x.origem === "maquininha"), "valor") },
+            link: { qtd: ativas.filter((x) => x.origem === "link").length, bruto: soma(ativas.filter((x) => x.origem === "link"), "valor") },
+            canceladas: itens.length - ativas.length, conciliadas: ativas.filter((x) => x.pvs.length).length },
+          info: { vendas_ok: !!cred.find((c) => c.banco === "stone_vendas")?.completo, conta_ok: !!cred.find((c) => c.banco === "stone")?.completo,
+            links: links.length, ultimo_arquivo: ultimo },
+        });
       }
 
       case "conc_lista": {

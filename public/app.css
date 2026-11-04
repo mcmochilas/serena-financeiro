@@ -287,3 +287,34 @@ table.tb { width: 100%; border-collapse: collapse; font-size: var(--cap); font-v
 .cc-sub { display: flex; flex-direction: column; gap: 6px; }
 .cc-obs { font-size: var(--cap); color: var(--muted); margin: 0; }
 .bk.stone_vendas { background: #E3F5EC; color: #13804B; }
+
+/* ===== Aba Stone: vendas na maquininha e no link ===== */
+.sv .bar { flex-wrap: wrap; gap: 10px; }
+.sv-filtros { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 12px 14px; }
+.sv-filtros small { opacity: .7; font-weight: 500; }
+.sv-filtros input { flex: 1 1 260px; min-width: 200px; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: var(--cap); background: #fff; }
+.sv-ult { font-size: 12px; color: var(--muted); margin-left: auto; }
+.sv-tab { padding: 0; overflow: auto; }
+.sv-tab table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.sv-tab th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; padding: 10px 12px; border-bottom: 1px solid var(--line); background: #FBF9F6; position: sticky; top: 0; }
+.sv-tab td { padding: 9px 12px; border-bottom: 1px solid var(--line2); vertical-align: top; }
+.sv-tab tbody tr:not(.det) { cursor: pointer; }
+.sv-tab tbody tr:not(.det):hover { background: #FBF9F6; }
+.sv-tab tr.aberto { background: #F6F2EB; }
+.sv-tab .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sv-tab .s { color: var(--muted); }
+.sv-tab .dt { white-space: nowrap; font-weight: 600; }
+.sv-tab .desc { min-width: 220px; max-width: 420px; }
+.sv-tab .desc b { font-weight: 700; }
+.sv-tab code { font-size: 11.5px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+.sv-tab tr.cancelada td { color: #9A938A; }
+.sv-tab .canc { font-size: 11px; color: var(--bad); font-weight: 700; }
+.sv-tab .sv-vazio { text-align: center; color: var(--muted); padding: 30px; }
+.org { font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.org.maquininha { background: #E3EEF3; color: var(--petrol); }
+.org.link { background: #FBF0DF; color: #8A5A12; }
+.sv-det { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; padding: 4px 0 6px; }
+.sv-det > div { display: flex; flex-direction: column; gap: 2px; }
+.sv-det > div > span:first-child { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; }
+.sv-det span:not(:first-child) { font-size: 12px; color: var(--muted); }
+.sv .cc-pag { padding: 10px 12px; margin: 0; }
