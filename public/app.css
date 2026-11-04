@@ -135,3 +135,24 @@ table.tb { width: 100%; border-collapse: collapse; font-size: var(--cap); font-v
 
 #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--petrol-d); color: #fff; padding: 10px 18px; border-radius: 999px; font-size: 14px; box-shadow: 0 8px 30px rgba(0,0,0,.25); z-index: 50; max-width: 90vw; }
 #toast.err { background: var(--bad); }
+
+/* notificações */
+.sino-w { position: relative; display: inline-flex; }
+.mods .sino { position: relative; margin-left: 4px; }
+.badge-n { position: absolute; top: -6px; right: -6px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: #C0392B; color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; box-shadow: 0 0 0 2px var(--petrol-d); }
+.np { position: absolute; top: calc(100% + 8px); right: 0; z-index: 50; width: min(380px, 92vw); max-height: 70vh; overflow: auto; background: #fff; color: #2B2B2B; border-radius: 12px; box-shadow: 0 12px 32px rgba(15,58,78,.25); text-align: left; }
+.np-h { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid #EEE7DC; font-family: var(--display); color: var(--petrol-d); position: sticky; top: 0; background: #fff; }
+.np-x { background: none !important; border: 0 !important; color: var(--petrol-d) !important; font-size: 20px; line-height: 1; padding: 0 4px !important; cursor: pointer; }
+.np ul { list-style: none; margin: 0; padding: 0; }
+.np li { padding: 10px 14px; border-bottom: 1px solid #F2ECE2; }
+.np li.nova { background: #FFF8EC; }
+.np-t { display: flex; justify-content: space-between; gap: 8px; font-weight: 700; color: var(--petrol-d); font-size: 13px; }
+.np-t time { font-weight: 400; color: #7A7366; font-size: 11px; white-space: nowrap; }
+.np-s { font-size: 12px; color: #5C564C; margin-top: 3px; }
+.np-i { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; margin-top: 4px; }
+.np-i span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #4A453D; }
+.np-i b { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.np-i b.pos { color: #16658A; } .np-i b.neg { color: #A8742A; }
+.np-vazio { padding: 16px 14px; margin: 0; font-size: 13px; color: #5C564C; }
+.np-err { margin: 10px 14px 0; padding: 8px 10px; border-radius: 8px; background: #FCEBEA; color: #8E2B22; font-size: 12px; }
+.np-f { padding: 10px 14px; font-size: 11px; color: #7A7366; background: #FAF7F2; }

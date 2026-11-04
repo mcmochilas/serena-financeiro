@@ -63,7 +63,7 @@ function telaLogin() {
     ev.preventDefault(); err.textContent = ''; btn.disabled = true;
     try {
       const r = await api('login', { login: u.value, pin: p.value });
-      localStorage.setItem(TK, r.token); S.me = r.me; S.ext = S.cred = S.users = null; render();
+      localStorage.setItem(TK, r.token); S.me = r.me; S.ext = S.cred = S.users = null; render(); checaNotifs();
     } catch (e) { err.textContent = e.message; btn.disabled = false; p.select(); }
   };
   const f = h('form', { class: 'lg-box', onsubmit: entrar },
@@ -85,11 +85,73 @@ function topo() {
     h('nav', { class: 'mods', 'aria-label': 'Módulos' },
       h('button', { type: 'button', 'aria-current': S.tela === 'extrato' ? 'page' : null, onclick: () => ir('extrato') }, 'Extrato'),
       ['Conciliação', 'Contas a pagar e receber', 'Fluxo de caixa', 'DRE'].map((m) => h('button', { type: 'button', disabled: true }, m + ' ', h('small', {}, '· em breve'))),
+      sino(),
       gear,
       h('span', { class: 'who' }, S.me.nome),
       h('button', { type: 'button', class: 'sair', onclick: sair }, 'Sair')));
 }
-async function sair() { try { await api('logout'); } catch (e) { /* ignora */ } localStorage.removeItem(TK); S.me = null; render(); }
+async function sair() { try { await api('logout'); } catch (e) { /* ignora */ } localStorage.removeItem(TK); S.me = null; S.notif = null; render(); }
+
+/* ---------- notificações (lançamentos novos encontrados pela atualização automática) ---------- */
+const SINO = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>';
+const brlSinal = (v) => (v > 0 ? '+' : '−') + brl.format(Math.abs(v));
+function sino() {
+  const n = S.notif?.nao_lidas || 0;
+  const b = h('button', { class: 'gear sino', type: 'button', title: 'Notificações', 'aria-label': n ? `Notificações: ${n} novas` : 'Notificações', 'aria-expanded': S.notifAberto ? 'true' : 'false', onclick: abreNotifs });
+  b.innerHTML = SINO;
+  if (n) b.append(h('span', { class: 'badge-n' }, n > 9 ? '9+' : String(n)));
+  return h('span', { class: 'sino-w' }, b, S.notifAberto ? painelNotifs() : null);
+}
+function painelNotifs() {
+  const lista = S.notif?.lista || [];
+  const auto = S.notif?.auto;
+  const falhou = auto && /falhou/i.test(auto.msg);
+  return h('div', { class: 'np', role: 'dialog', 'aria-label': 'Notificações', onclick: (e) => e.stopPropagation() },
+    h('div', { class: 'np-h' }, h('strong', {}, 'Notificações'), h('button', { type: 'button', class: 'np-x', 'aria-label': 'Fechar', onclick: () => { S.notifAberto = false; render(); } }, '×')),
+    falhou ? h('div', { class: 'np-err' }, `Última atualização automática falhou (${quando(auto.at)}): ${auto.msg.replace(/^Atualização automática falhou:\s*/, '')}`) : null,
+    lista.length ? h('ul', {}, lista.map((n) => h('li', { class: new Date(n.criado) > new Date(S.notif.visto_antes || 0) ? 'nova' : '' },
+      h('div', { class: 'np-t' }, n.titulo, h('time', {}, quando(n.criado))),
+      n.texto ? h('div', { class: 'np-s' }, n.texto) : null,
+      (n.dados?.itens || []).slice(0, 6).map((i) => h('div', { class: 'np-i' }, h('span', {}, `${dia(i.data)} · ${i.descricao || 'Lançamento'}`), h('b', { class: i.valor > 0 ? 'pos' : 'neg' }, brlSinal(i.valor)))),
+      (n.dados?.itens || []).length > 6 ? h('div', { class: 'np-s' }, `e mais ${n.dados.itens.length - 6}…`) : null)))
+      : h('p', { class: 'np-vazio' }, 'Nenhuma notificação ainda. Quando a atualização automática encontrar lançamentos novos, eles aparecem aqui.'),
+    h('div', { class: 'np-f' }, 'Saldo e lançamentos do Bradesco são atualizados automaticamente a cada 15 minutos.'));
+}
+async function abreNotifs(e) {
+  e.stopPropagation();
+  S.notifAberto = !S.notifAberto;
+  if (S.notifAberto && S.notif?.nao_lidas) {
+    S.notif.visto_antes = S.notif.visto; S.notif.nao_lidas = 0;
+    api('notifs_visto').catch(() => {});
+  }
+  if (S.notifAberto && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
+  render();
+}
+document.addEventListener('click', () => { if (S.notifAberto) { S.notifAberto = false; render(); } });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.notifAberto) { S.notifAberto = false; render(); } });
+
+let ultimaVista = null, extEm = 0;
+async function checaNotifs() {
+  if (!S.me) return;
+  let r; try { r = await api('notifs'); } catch (e) { return; }
+  const ant = ultimaVista;
+  ultimaVista = r.ultima_id;
+  S.notif = { ...r, visto: S.notif?.visto, visto_antes: S.notif?.visto_antes };
+  const novas = ant != null && r.ultima_id > ant ? r.lista.filter((n) => n.id > ant) : [];
+  if (novas.length) {
+    toast(novas[0].titulo + (novas[0].texto ? ' · ' + novas[0].texto : ''));
+    if ('Notification' in window && Notification.permission === 'granted' && document.hidden)
+      try { new Notification('Serena Financeiro', { body: novas[0].titulo + (novas[0].texto ? '\n' + novas[0].texto : ''), icon: '/icon.png' }); } catch (e) { /* ignora */ }
+  }
+  // recarrega o extrato quando chegou lançamento novo, ou a cada 15 min para trazer o saldo atualizado
+  const ocupado = document.activeElement && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
+  if (S.tela === 'extrato' && S.ext && !ocupado && (novas.length || Date.now() - extEm > 15 * 60e3)) {
+    try { S.ext = await api('extrato', { banco: 'bradesco' }); extEm = Date.now(); } catch (e) { /* ignora */ }
+  }
+  if (!ocupado || novas.length) render();
+}
+setInterval(() => { if (!document.hidden) checaNotifs(); }, 60e3);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checaNotifs(); });
 
 async function sincronizar(btn, dias) {
   const t = btn.textContent; btn.disabled = true; btn.textContent = 'Sincronizando…';
@@ -137,7 +199,7 @@ function telaExtrato() {
   const wrap = h('div', { class: 'body' });
   if (!S.ext) {
     wrap.append(h('div', { class: 'loading' }, 'Carregando extrato…'));
-    api('extrato', { banco: 'bradesco' }).then((r) => { S.ext = r; render(); }).catch((e) => toast(e.message, true));
+    api('extrato', { banco: 'bradesco' }).then((r) => { S.ext = r; extEm = Date.now(); render(); }).catch((e) => toast(e.message, true));
     return wrap;
   }
   const rows = ordenados(S.ext.rows || []);
@@ -467,4 +529,5 @@ let rz; window.addEventListener('resize', () => { clearTimeout(rz); rz = setTime
   $('#app').replaceChildren(h('div', { class: 'loading' }, 'Carregando…'));
   try { S.me = (await api('me')).me; } catch (e) { S.me = null; }
   render();
+  checaNotifs();
 })();

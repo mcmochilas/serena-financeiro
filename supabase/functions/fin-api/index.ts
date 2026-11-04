@@ -158,12 +158,80 @@ async function bradCred() {
   return { amb: c.ambiente as "producao" | "sandbox", id: c.client_id as string, secret: secret as string, pfx: pfx as string, senha: (senha as string) || "", agencia: c.agencia as string, conta: c.conta as string };
 }
 
+// "agora" no fuso de Brasília (o banco trabalha com datas locais; depois das 21h o UTC já é o dia seguinte)
+const agoraBR = () => new Date(Date.now() - 3 * 3600e3);
+const brl = (v: number) => (v < 0 ? "-" : "+") + "R$ " + Math.abs(v).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// Grava o saldo: se não mudou desde a última consulta, só atualiza o horário (não acumula linhas iguais)
+async function gravaSaldo(conta: string, json: any) {
+  const sd = saldoItens(json);
+  const ult = (await q(db.from("fin_saldos").select("id,total,itens").eq("banco", "bradesco").order("em", { ascending: false }).limit(1)))[0];
+  if (ult && Number(ult.total) === Number(sd.total) && JSON.stringify(ult.itens) === JSON.stringify(sd.itens))
+    await q(db.from("fin_saldos").update({ em: new Date().toISOString() }).eq("id", ult.id));
+  else await q(db.from("fin_saldos").insert({ banco: "bradesco", conta, total: sd.total, itens: sd.itens, raw: json }));
+  return sd;
+}
+
+// Rotina automática (a cada 15 min, pelo pg_cron): saldo + lançamentos dos últimos dias.
+// Grava tudo (nada é apagado) e, se aparecer lançamento que ainda não estava no banco, cria uma notificação.
+async function rotina() {
+  const c = (await credenciais()).find((x) => x.banco === "bradesco");
+  if (!c?.completo) return { ok: false, motivo: "Bradesco não configurado" };
+  const cr = await bradCred();
+  const fim = agoraBR();
+  const x = await bradesco(cr, new Date(fim.getTime() - 2 * 864e5), fim, { saldo: true });
+  if (!x.ok) { await log("auto", `Atualização automática falhou: ${explica(x)}`); return { ok: false, motivo: explica(x) }; }
+  const rows = lancamentos(x.json, cr.conta);
+  const sd = x.saldo?.json ? await gravaSaldo(cr.conta, x.saldo.json) : null;
+
+  // o que já estava gravado nesses dias
+  const dias = [...new Set(rows.map((r) => r.data))];
+  const ja = dias.length ? await q(db.from("fin_lancamentos").select("id,data,valor").eq("banco", "bradesco").in("data", dias)) : [];
+  const ids = new Set(ja.map((r: any) => r.id));
+  // conferência extra por dia+valor: evita avisar de novo um lançamento que o banco reapresentou com outro número
+  const qtd = new Map<string, number>();
+  for (const r of ja) { const k = `${r.data}|${Number(r.valor)}`; qtd.set(k, (qtd.get(k) || 0) + 1); }
+  // primeiro descontam os que já batem pelo identificador; o que sobrar por dia+valor cobre os reapresentados
+  for (const r of rows) if (ids.has(r.id)) { const k = `${r.data}|${r.valor}`; qtd.set(k, Math.max(0, (qtd.get(k) || 0) - 1)); }
+  const novos: any[] = [];
+  for (const r of rows) {
+    if (ids.has(r.id)) continue;
+    const k = `${r.data}|${r.valor}`;
+    const n = qtd.get(k) || 0;
+    if (n > 0) { qtd.set(k, n - 1); continue; }
+    novos.push(r);
+  }
+  const reapresentados = new Set(rows.filter((r) => !ids.has(r.id) && !novos.includes(r)).map((r) => r.id));
+  const gravar = rows.filter((r) => !reapresentados.has(r.id));
+  for (let i = 0; i < gravar.length; i += 500) await q(db.from("fin_lancamentos").upsert(gravar.slice(i, i + 500)));
+
+  if (novos.length) {
+    const ent = novos.filter((r) => r.valor > 0).reduce((s, r) => s + r.valor, 0);
+    const sai = novos.filter((r) => r.valor < 0).reduce((s, r) => s + r.valor, 0);
+    const titulo = novos.length === 1 ? "1 novo lançamento no Bradesco" : `${novos.length} novos lançamentos no Bradesco`;
+    const partes = [ent ? `Entradas ${brl(ent)}` : "", sai ? `Saídas ${brl(sai)}` : "", sd?.itens ? `Saldo ${brl((sd.itens.find((i) => i.codigo === 1005) || { valor: sd.total || 0 }).valor).replace("+", "")}` : ""].filter(Boolean);
+    await q(db.from("fin_notificacoes").insert({
+      banco: "bradesco", titulo, texto: partes.join(" · "),
+      dados: { itens: novos.slice(0, 50).map((r) => ({ id: r.id, data: r.data, valor: r.valor, descricao: r.descricao })) },
+    }));
+    await log("auto", `${titulo}`);
+  }
+  return { ok: true, lidos: rows.length, novos: novos.length, saldo: sd?.total ?? null };
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   try {
     must(req.method === "POST", "Use POST.", 405);
     const b = await req.json().catch(() => ({}));
     const op = String(b.op || "");
+
+    if (op === "cron") {
+      const k = req.headers.get("x-fin-cron") || "";
+      const certa = await q(db.rpc("fin_cron_key"));
+      must(k && certa && k === certa, "Não autorizado.", 401);
+      return out(await rotina());
+    }
 
     if (op === "login") {
       const tok = await q(db.rpc("fin_login", { p_login: txt(b.login, 40), p_pin: txt(b.pin, 20) }));
@@ -283,18 +351,27 @@ Deno.serve(async (req) => {
         must(admin, "Só administradores sincronizam o extrato.");
         const dias = Math.min(365, Math.max(1, Number(b.dias) || 90));
         const cr = await bradCred();
-        const x = await bradesco(cr, new Date(Date.now() - (dias - 1) * 864e5), new Date(), { saldo: true });
+        const fim = agoraBR();
+        const x = await bradesco(cr, new Date(fim.getTime() - (dias - 1) * 864e5), fim, { saldo: true });
         if (!x.ok) throw new Erro(explica(x), 502);
         const rows = lancamentos(x.json, cr.conta);
-        if (x.saldo?.json) {
-          const sd = saldoItens(x.saldo.json);
-          await q(db.from("fin_saldos").insert({ banco: "bradesco", conta: cr.conta, total: sd.total, itens: sd.itens, raw: x.saldo.json }));
-        }
+        if (x.saldo?.json) await gravaSaldo(cr.conta, x.saldo.json);
         for (let i = 0; i < rows.length; i += 500) await q(db.from("fin_lancamentos").upsert(rows.slice(i, i + 500)));
         await q(db.from("fin_credenciais").update({ teste_em: new Date().toISOString(), teste_ok: true, teste_msg: `Sincronizado: ${rows.length} lançamentos dos últimos ${dias} dias.` }).eq("banco", "bradesco"));
         await log(me.login, `${me.nome} sincronizou o extrato Bradesco: ${rows.length} lançamentos (${dias} dias)`);
         return out({ ok: true, n: rows.length, dias, saldo: x.saldo?.json ? saldoItens(x.saldo.json).total : null, saldo_erro: x.saldo && !x.saldo.json ? `HTTP ${x.saldo.status}: ${x.saldo.texto}` : null });
       }
+
+      case "notifs": {
+        const u = await q(db.from("fin_users").select("notif_visto").eq("login", me.login).single());
+        const lista = await q(db.from("fin_notificacoes").select("id,criado,banco,titulo,texto,dados").order("criado", { ascending: false }).limit(30));
+        const visto = u.notif_visto ? new Date(u.notif_visto).getTime() : Date.now() - 7 * 864e5;
+        const auto = (await q(db.from("fin_log").select("at,msg").eq("login", "auto").order("at",{ ascending: false }).limit(1)))[0] || null;
+        return out({ lista, nao_lidas: lista.filter((n: any) => new Date(n.criado).getTime() > visto).length, ultima_id: lista[0]?.id || 0, auto });
+      }
+      case "notifs_visto":
+        await q(db.from("fin_users").update({ notif_visto: new Date().toISOString() }).eq("login", me.login));
+        return out({ ok: true });
 
       case "users": {
         must(admin, "Só administradores veem os usuários.");
