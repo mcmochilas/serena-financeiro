@@ -33,6 +33,7 @@ language sql stable security definer set search_path = '' as $$
   where o.data->>'canal' = 'consultiva'
     and coalesce(o.data->>'status', '') <> 'excluido'
     and o.data->>'total' is not null
+    and (o.data->>'total')::numeric > 0
     and o.data->>'date' ~ '^\d{2}/\d{2}/\d{4}$'
     and to_date(o.data->>'date', 'DD/MM/YYYY') between p_de and p_ate
 $$;
