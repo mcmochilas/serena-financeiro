@@ -48,7 +48,7 @@ async function api(op, body = {}) {
 
 /* ---------- estado ---------- */
 const S = {
-  me: null, tela: location.hash === '#configuracoes' ? 'configuracoes' : 'extrato', cfg: 'apis',
+  me: null, tela: ({ '#configuracoes': 'configuracoes', '#conciliacao': 'conciliacao' })[location.hash] || 'extrato', cfg: 'apis',
   periodo: '30d', tipo: 'todos', busca: '',
   ext: null, cred: null, users: null, banco: localStorage.getItem('fin_banco') === 'stone' ? 'stone' : 'bradesco',
 };
@@ -77,7 +77,7 @@ function telaLogin() {
 
 /* ---------- topo ---------- */
 const GEAR = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.54 15a1.7 1.7 0 0 0-1.56-1.03H2.9a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1.03-1.56V2.9a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.86 1 1.52 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.56 1.03z"/></svg>';
-function ir(tela) { S.tela = tela; history.replaceState(null, '', tela === 'extrato' ? '#' : '#configuracoes'); render(); }
+function ir(tela) { S.tela = tela; history.replaceState(null, '', tela === 'extrato' ? '#' : '#' + tela); render(); window.scrollTo(0, 0); }
 function topo() {
   const gear = h('button', { class: 'gear', type: 'button', title: 'Configurações', 'aria-label': 'Configurações', 'aria-current': S.tela === 'configuracoes' ? 'page' : null, onclick: () => ir('configuracoes') });
   gear.innerHTML = GEAR;
@@ -85,7 +85,8 @@ function topo() {
     h('div', { class: 'brand' }, h('img', { src: '/logo-escuro.png', alt: 'Serena Puxadores' }), h('span', { class: 'div' }), h('span', { class: 'tag' }, 'Financeiro')),
     h('nav', { class: 'mods', 'aria-label': 'Módulos' },
       h('button', { type: 'button', 'aria-current': S.tela === 'extrato' ? 'page' : null, onclick: () => ir('extrato') }, 'Extrato'),
-      ['Conciliação', 'Contas a pagar e receber', 'Fluxo de caixa', 'DRE'].map((m) => h('button', { type: 'button', disabled: true }, m + ' ', h('small', {}, '· em breve'))),
+      h('button', { type: 'button', 'aria-current': S.tela === 'conciliacao' ? 'page' : null, onclick: () => ir('conciliacao') }, 'Conciliação'),
+      ['Contas a pagar e receber', 'Fluxo de caixa', 'DRE'].map((m) => h('button', { type: 'button', disabled: true }, m + ' ', h('small', {}, '· em breve'))),
       sino(),
       gear,
       h('span', { class: 'who' }, S.me.nome),
@@ -146,10 +147,13 @@ async function checaNotifs() {
   }
   // recarrega o extrato quando chegou lançamento novo, ou a cada 15 min para trazer o saldo atualizado
   const ocupado = document.activeElement && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
+  let recarregou = false;
   if (S.tela === 'extrato' && S.ext && !ocupado && (novas.length || Date.now() - extEm > 15 * 60e3)) {
-    try { S.ext = await api('extrato', { banco: S.banco }); extEm = Date.now(); } catch (e) { /* ignora */ }
+    try { S.ext = await api('extrato', { banco: S.banco }); extEm = Date.now(); recarregou = true; } catch (e) { /* ignora */ }
   }
-  if (!ocupado || novas.length) render();
+  if (recarregou) render();
+  else { const w = $('.sino-w'); if (w) w.replaceWith(sino()); }
+  if (novas.length && S.tela === 'conciliacao' && typeof concNovos === 'function') concNovos();
 }
 setInterval(() => { if (!document.hidden) checaNotifs(); }, 60e3);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) checaNotifs(); });
@@ -558,7 +562,7 @@ function painelUsuarios() {
 function render() {
   const app = $('#app');
   if (!S.me) { app.replaceChildren(telaLogin()); return; }
-  app.replaceChildren(topo(), S.tela === 'configuracoes' ? telaConfig() : telaExtrato());
+  app.replaceChildren(topo(), S.tela === 'configuracoes' ? telaConfig() : S.tela === 'conciliacao' ? telaConciliacao() : telaExtrato());
 }
 let rz; window.addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => { if (S.me && S.tela === 'extrato' && S.ext) render(); }, 200); });
 

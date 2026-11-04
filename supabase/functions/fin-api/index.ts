@@ -1,6 +1,7 @@
 // Serena Financeiro — API única (login usuário+PIN, extrato, credenciais dos bancos, usuários)
 // Publicada sem verificação de JWT: a autenticação é feita aqui, por token de sessão (x-fin-token).
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { candidatos, ehRecebimentoDeCliente, pagador, JANELA, type Pedido } from "./conc.ts";
 
 const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
 const CORS = {
@@ -390,6 +391,43 @@ async function rotina() {
   return { ok: true, ...res };
 }
 
+
+// ---------- Conciliação: pré-vendas (Picking) x recebimentos ----------
+const isoDia = (v: unknown, padrao: string) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : padrao;
+const somaDias = (iso: string, n: number) => new Date(Date.parse(iso + "T12:00:00Z") + n * 864e5).toISOString().slice(0, 10);
+const r2 = (v: number) => Math.round(v * 100) / 100;
+const emLotes = async <T>(ids: string[], f: (lote: string[]) => Promise<T[]>) => { const out: T[] = []; for (let i = 0; i < ids.length; i += 150) out.push(...await f(ids.slice(i, i + 150))); return out; };
+const pedidoDe = (r: any): Pedido & Record<string, unknown> => ({ ...r, data: String(r.data), total: Number(r.total) });
+// Recebimentos de cliente ainda livres (sem conciliação) entre duas datas
+async function recebimentosLivres(de: string, ate: string, extraIds: string[] = []) {
+  const rows: any[] = [];
+  for (let i = 0; i < 20000; i += 1000) {
+    const pg = await q(db.from("fin_lancamentos").select("id,banco,data,descricao,valor,categoria").gt("valor", 0).gte("data", de).lte("data", ate)
+      .order("data").order("id").range(i, i + 999));
+    rows.push(...pg); if (pg.length < 1000) break;
+  }
+  const lanc = rows.map((r) => ({ ...r, valor: Number(r.valor), data: String(r.data) })).filter(ehRecebimentoDeCliente);
+  const usados = new Set((await emLotes(lanc.map((l) => l.id), (l) => q(db.from("fin_conc_itens").select("ref").eq("tipo", "lancamento").in("ref", l)))).map((x: any) => x.ref));
+  return lanc.filter((l) => !usados.has(l.id) || extraIds.includes(l.id));
+}
+// Conciliações (com os recebimentos e pré-vendas de cada uma) a partir dos ids das conciliações
+async function detalhesConc(ids: number[]) {
+  if (!ids.length) return new Map<number, any>();
+  const concs = await q(db.from("fin_conc").select("id,criado,por,obs,total_pedidos,total_pagos").in("id", ids));
+  const itens = await q(db.from("fin_conc_itens").select("tipo,ref,conc_id,valor").in("conc_id", ids));
+  const lancIds = itens.filter((i: any) => i.tipo === "lancamento").map((i: any) => i.ref);
+  const lancs = lancIds.length ? await emLotes(lancIds, (l) => q(db.from("fin_lancamentos").select("id,banco,data,descricao,valor").in("id", l))) : [];
+  const porId = new Map(lancs.map((l: any) => [l.id, l]));
+  const m = new Map<number, any>();
+  for (const c of concs) {
+    const its = itens.filter((i: any) => i.conc_id === c.id);
+    m.set(c.id, { ...c, total_pedidos: Number(c.total_pedidos), total_pagos: Number(c.total_pagos), diferenca: r2(Number(c.total_pagos) - Number(c.total_pedidos)),
+      pedidos: its.filter((i: any) => i.tipo === "pedido").map((i: any) => i.ref),
+      recebimentos: its.filter((i: any) => i.tipo === "lancamento").map((i: any) => { const l: any = porId.get(i.ref) || { id: i.ref, valor: i.valor, descricao: "(lançamento não encontrado)" }; return { ...l, valor: Number(l.valor), pagador: pagador(l.descricao) }; }) });
+  }
+  return m;
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   try {
@@ -547,6 +585,120 @@ Deno.serve(async (req) => {
         await q(db.from("fin_credenciais").update({ teste_em: new Date().toISOString(), teste_ok: true, teste_msg: `Sincronizado: ${x.rows.length} lançamentos dos últimos ${dias} dias.` }).eq("banco", banco));
         await log(me.login, `${me.nome} sincronizou o extrato ${NOME[banco]}: ${x.rows.length} lançamentos (${dias} dias)`);
         return out({ ok: true, n: x.rows.length, dias, saldo: x.saldo?.total ?? null, saldo_erro: x.saldo_erro || null });
+      }
+
+      case "conc_lista": {
+        const hoje = agoraBR().toISOString().slice(0, 10);
+        const ate = isoDia(b.ate, hoje), de = isoDia(b.de, somaDias(ate, -29));
+        const margem = Math.min(1000, Math.max(0, Number(b.margem) || 10));
+        const status = ["pendentes", "conciliados", "todos"].includes(b.status) ? b.status : "pendentes";
+        const busca = txt(b.busca, 80).toUpperCase(), vend = txt(b.vendedora, 60);
+        const por = Math.min(100, Math.max(5, Number(b.por) || 20));
+        const todos = (await q(db.rpc("fin_pedidos", { p_de: de, p_ate: ate }))).map(pedidoDe);
+        // em que conciliação está cada pré-venda
+        const vinc = await emLotes(todos.map((p) => p.id), (l) => q(db.from("fin_conc_itens").select("ref,conc_id").eq("tipo", "pedido").in("ref", l)));
+        const concDe = new Map(vinc.map((v: any) => [v.ref, v.conc_id as number]));
+        const vendedoras = [...new Set(todos.map((p) => String(p.vendedora || "")).filter(Boolean))].sort();
+        // resumo do período (todas as pré-vendas, sem os filtros de status/busca)
+        const conc = todos.filter((p) => concDe.has(p.id)), pend = todos.filter((p) => !concDe.has(p.id) && p.total > 0);
+        const soma = (a: any[]) => r2(a.reduce((s, p) => s + p.total, 0));
+        let lista = todos.filter((p) => status === "todos" || (status === "conciliados" ? concDe.has(p.id) : !concDe.has(p.id)));
+        if (vend) lista = lista.filter((p) => p.vendedora === vend);
+        if (busca) lista = lista.filter((p) => [p.id, p.num, p.cliente, p.vendedora, p.cidade].some((x) => String(x || "").toUpperCase().includes(busca)) || String(p.total).includes(busca.replace(",", ".")));
+        lista.sort((a, z) => z.data.localeCompare(a.data) || String(z.hora || "").localeCompare(String(a.hora || "")) || z.id.localeCompare(a.id));
+        const paginas = Math.max(1, Math.ceil(lista.length / por));
+        const pagina = Math.min(paginas, Math.max(1, Number(b.pagina) || 1));
+        const itens: any[] = lista.slice((pagina - 1) * por, pagina * por).map((p) => ({ ...p, conc_id: concDe.get(p.id) || null }));
+        // sugestões só para as pendentes desta página; detalhes das conciliadas
+        const pendPag = itens.filter((p) => !p.conc_id);
+        const livres = pendPag.length ? await recebimentosLivres(somaDias(pendPag.reduce((m, p) => p.data < m ? p.data : m, "9999"), -JANELA.antes), somaDias(pendPag.reduce((m, p) => p.data > m ? p.data : m, ""), JANELA.depois)) : [];
+        for (const p of pendPag) {
+          const c = candidatos(p, livres, margem, 50);
+          const top = c[0];
+          p.sug = { n: c.filter((x) => Math.abs(x.diff) <= margem + 0.001).length, nomes: c.filter((x) => x.nome >= 0.5).length,
+            melhor: top ? { id: top.id, valor: top.valor, diff: top.diff, pagador: top.pagador, data: top.data, score: top.score, nivel: top.nivel, motivos: top.motivos } : null };
+        }
+        const det = await detalhesConc([...new Set(itens.map((p) => p.conc_id).filter(Boolean))] as number[]);
+        for (const p of itens) if (p.conc_id) p.conc = det.get(p.conc_id) || null;
+        // recebimentos de cliente do período que ainda não foram ligados a nenhuma pré-venda
+        const soltos = await recebimentosLivres(de, ate);
+        return out({
+          de, ate, margem, status, pagina, paginas, total: lista.length, por, vendedoras, itens,
+          resumo: { qtd: todos.length, valor: soma(todos), conc_qtd: conc.length, conc_valor: soma(conc), pend_qtd: pend.length, pend_valor: soma(pend),
+            receb_soltos_qtd: soltos.length, receb_soltos_valor: r2(soltos.reduce((s, l) => s + l.valor, 0)) },
+        });
+      }
+
+      case "conc_sugestoes": {
+        const id = txt(b.pedido, 40);
+        const margem = Math.min(1000, Math.max(0, Number(b.margem) || 10));
+        const [p0] = await q(db.rpc("fin_pedidos_ids", { p_ids: [id] }));
+        must(p0, "Pré-venda não encontrada.", 404);
+        const p = pedidoDe(p0);
+        const ci = await q(db.from("fin_conc_itens").select("conc_id").eq("tipo", "pedido").eq("ref", id).maybeSingle());
+        if (ci) {
+          const c = (await detalhesConc([ci.conc_id])).get(ci.conc_id);
+          const outros = c.pedidos.filter((x: string) => x !== id);
+          const juntos = outros.length ? (await q(db.rpc("fin_pedidos_ids", { p_ids: outros }))).map(pedidoDe) : [];
+          return out({ pedido: p, conc: { ...c, pedidos_det: [p, ...juntos] }, candidatos: [] });
+        }
+        const livres = await recebimentosLivres(somaDias(p.data, -JANELA.antes - 10), somaDias(p.data, JANELA.depois + 30));
+        let lista = candidatos(p, livres, margem, 15);
+        // busca manual: por nome do pagador ou valor, em qualquer recebimento livre da janela ampliada
+        const busca = txt(b.busca, 60);
+        if (busca) {
+          const v = Number(busca.replace(/[^\d,.-]/g, "").replace(/\.(?=\d{3}(\D|$))/g, "").replace(",", "."));
+          const t = busca.toUpperCase();
+          const achados = livres.filter((l) => (v > 0 && Math.abs(l.valor - v) <= Math.max(1, margem)) || (!(v > 0) && l.descricao.toUpperCase().includes(t)));
+          const ja = new Set(lista.map((c) => c.id));
+          const extra = candidatos(p, achados, 1e9, 30).filter((c) => !ja.has(c.id));
+          lista = [...lista, ...extra].slice(0, 40);
+        }
+        // outras pré-vendas pendentes do mesmo cliente (pagamento único de mais de uma pré-venda)
+        const vizinhos = (await q(db.rpc("fin_pedidos", { p_de: somaDias(p.data, -30), p_ate: somaDias(p.data, 30) }))).map(pedidoDe)
+          .filter((x) => x.id !== p.id && x.total > 0 && ((p.cliente_cod && x.cliente_cod === p.cliente_cod && !/CONSUMIDOR/i.test(p.cliente)) || (!/CONSUMIDOR/i.test(p.cliente) && x.cliente === p.cliente)));
+        const usados = new Set(vizinhos.length ? (await q(db.from("fin_conc_itens").select("ref").eq("tipo", "pedido").in("ref", vizinhos.map((x) => x.id)))).map((x: any) => x.ref) : []);
+        const mesmos = vizinhos.filter((x) => !usados.has(x.id));
+        // um recebimento que bate com a soma desta pré-venda com outra do mesmo cliente
+        const combos: any[] = [];
+        for (const o of mesmos) {
+          const alvo = { ...p, total: r2(p.total + o.total) };
+          for (const c of candidatos(alvo, livres, margem, 3).filter((c) => Math.abs(c.diff) <= margem + 0.001)) combos.push({ ...c, junto: o.id, total_junto: alvo.total });
+        }
+        return out({ pedido: p, conc: null, candidatos: lista, mesmo_cliente: mesmos, combos: combos.slice(0, 5) });
+      }
+
+      case "conc_criar": {
+        must(admin, "Só administradores conciliam.");
+        const pedIds = [...new Set((Array.isArray(b.pedidos) ? b.pedidos : []).map((x: unknown) => txt(x, 40)).filter(Boolean))] as string[];
+        const lancIds = [...new Set((Array.isArray(b.lancamentos) ? b.lancamentos : []).map((x: unknown) => txt(x, 200)).filter(Boolean))] as string[];
+        must(pedIds.length && pedIds.length <= 20, "Escolha a pré-venda.", 400);
+        must(lancIds.length && lancIds.length <= 30, "Escolha pelo menos um recebimento.", 400);
+        const peds = (await q(db.rpc("fin_pedidos_ids", { p_ids: pedIds }))).map(pedidoDe);
+        must(peds.length === pedIds.length, "Alguma pré-venda não foi encontrada.", 400);
+        const lancs = await q(db.from("fin_lancamentos").select("id,valor,descricao").in("id", lancIds));
+        must(lancs.length === lancIds.length && lancs.every((l: any) => Number(l.valor) > 0), "Algum recebimento não foi encontrado.", 400);
+        const ja = await q(db.from("fin_conc_itens").select("tipo,ref").or(`and(tipo.eq.pedido,ref.in.(${pedIds.map((x) => `"${x}"`).join(",")})),and(tipo.eq.lancamento,ref.in.(${lancIds.map((x) => `"${x}"`).join(",")}))`));
+        must(!ja.length, `Já conciliado: ${ja.map((x: any) => x.tipo === "pedido" ? x.ref : "um dos recebimentos").join(", ")}. Atualize a tela.`, 409);
+        const tp = r2(peds.reduce((s, p) => s + p.total, 0)), tl = r2(lancs.reduce((s: number, l: any) => s + Number(l.valor), 0));
+        const c = await q(db.from("fin_conc").insert({ por: me.login, obs: txt(b.obs, 300) || null, total_pedidos: tp, total_pagos: tl }).select("id").single());
+        const { error } = await db.from("fin_conc_itens").insert([
+          ...peds.map((p) => ({ tipo: "pedido", ref: p.id, conc_id: c.id, valor: p.total })),
+          ...lancs.map((l: any) => ({ tipo: "lancamento", ref: l.id, conc_id: c.id, valor: Number(l.valor) })),
+        ]);
+        if (error) { await db.from("fin_conc").delete().eq("id", c.id); throw new Erro(/duplicate|unique/i.test(error.message) ? "Alguém acabou de conciliar um desses itens. Atualize a tela." : error.message, 409); }
+        await log(me.login, `${me.nome} conciliou ${pedIds.join(", ")} com ${lancIds.length} recebimento(s): ${brl(tl).replace("+", "")} de ${brl(tp).replace("+", "")}`);
+        return out({ ok: true, id: c.id, diferenca: r2(tl - tp) });
+      }
+
+      case "conc_desfazer": {
+        must(admin, "Só administradores desfazem conciliações.");
+        const id = Number(b.id);
+        const c = await q(db.from("fin_conc_itens").select("ref").eq("conc_id", id).eq("tipo", "pedido"));
+        must(c.length, "Conciliação não encontrada.", 404);
+        await q(db.from("fin_conc").delete().eq("id", id));
+        await log(me.login, `${me.nome} desfez a conciliação de ${c.map((x: any) => x.ref).join(", ")}`);
+        return out({ ok: true });
       }
 
       case "notifs": {
