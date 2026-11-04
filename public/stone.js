@@ -22,7 +22,7 @@ async function svCarrega() {
 }
 function svFiltradas() {
   const t = SV.busca.trim().toUpperCase(), tn = t.replace(/\./g, '').replace(',', '.');
-  return (SV.data?.itens || []).filter((v) => {
+  return (SV.data?.itens || []).slice().sort((a, z) => (z.data + (z.hora || '')).localeCompare(a.data + (a.hora || ''))).filter((v) => {
     if (SV.origem !== 'todas' && v.origem !== SV.origem) return false;
     if (!t) return true;
     const campos = [v.link?.descricao, v.link?.cliente, v.link?.code, v.cartao, v.bandeira, v.tipo_conta, v.link_id, ...(v.pvs || []), v.pv_no_link, v.stonecode].map((x) => String(x || '').toUpperCase());
