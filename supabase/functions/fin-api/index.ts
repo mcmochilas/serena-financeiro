@@ -94,28 +94,41 @@ function categoria(desc: string, valor: number) {
   if (/INVEST|RESG|APLIC|RENTAB|CDB/.test(d)) return "Investimentos";
   return valor > 0 ? "Outras entradas" : "Outras saídas";
 }
-// Lançamentos do extrato por período (ou, se não vier, dos últimos lançamentos), sem saldo anterior nem lançamentos futuros
+// Junta os lançamentos do extrato por período (dias já fechados) com os últimos lançamentos e os
+// lançamentos do dia (dias recentes e hoje). Saldo anterior e lançamentos futuros ficam de fora.
+// Um lançamento que aparece nos dois blocos entra uma vez só.
 function lancamentos(j: any, conta: string) {
-  const brutos: any[] = [];
+  const blocos: any[][] = [];
   const per = j?.extratoPorPeriodo?.lstLancamentoMensal;
-  if (Array.isArray(per)) per.forEach((l: any) => { if (!["01", "04", "05"].includes(String(l.tipoLancamento))) brutos.push(l); });
+  if (Array.isArray(per)) blocos.push(per.filter((l: any) => ![1, 4, 5].includes(Number(l.tipoLancamento))));
   const ult = j?.extratoUltimosLancamentos?.listaLancamentos;
-  if (!brutos.length && ult && typeof ult === "object") for (const [k, lista] of Object.entries(ult)) {
+  if (ult && typeof ult === "object") for (const [k, lista] of Object.entries(ult)) {
     if (/saldo anterior|futuro/i.test(k) || !Array.isArray(lista)) continue;
-    (lista as any[]).forEach((l) => brutos.push(l));
+    blocos.push(lista as any[]);
   }
-  const vistos = new Map<string, number>(), rows: any[] = [];
-  for (const l of brutos) {
-    const data = dataISO(l.dataLancamento); if (!data) continue;
-    const v = num(l.valorLancamento) * (String(l.sinalLancamento).trim() === "-" ? -1 : 1);
-    if (!v) continue;
-    const saldo = l.valorSaldoAposLancamento ? num(l.valorSaldoAposLancamento) * (String(l.sinalSaldo).trim() === "-" ? -1 : 1) : null;
-    const desc = [String(l.descritivoLancamentoCompleto || l.descritivoLancamentoAbreviado || "").trim(), String(l.segundaLinhalLancamento || "").trim()].filter(Boolean).join(" · ");
-    const base = `brd-${conta}-${data}-${String(l.numeroDocumento || "").trim()}-${String(l.codigoLancamento || "").trim()}-${Math.round(v * 100)}`;
-    const n = (vistos.get(base) || 0) + 1; vistos.set(base, n);
-    rows.push({ id: `${base}-${n}`, banco: "bradesco", conta, data, descricao: desc, categoria: categoria(desc, v), tipo: v > 0 ? "Entrada" : "Saída",
-      valor: Math.round(v * 100) / 100, saldo, documento: String(l.numeroDocumento || "").trim() || null, raw: l });
+  const porChave = new Map<string, any[]>();
+  for (const bloco of blocos) {
+    const doBloco = new Map<string, any[]>();
+    for (const l of bloco) {
+      const data = dataISO(l.dataLancamento); if (!data) continue;
+      const v = num(l.valorLancamento) * (String(l.sinalLancamento).trim() === "-" ? -1 : 1);
+      if (!v) continue;
+      const saldo = l.valorSaldoAposLancamento ? num(l.valorSaldoAposLancamento) * (String(l.sinalSaldo).trim() === "-" ? -1 : 1) : null;
+      const desc = [String(l.descritivoLancamentoCompleto || l.descritivoLancamentoAbreviado || "").trim(), String(l.segundaLinhalLancamento || "").trim()].filter(Boolean).join(" · ");
+      const base = `brd-${conta}-${data}-${String(l.numeroDocumento || "").trim()}-${String(l.codigoLancamento || "").trim()}-${Math.round(v * 100)}`;
+      const lista = doBloco.get(base) || []; 
+      lista.push({ banco: "bradesco", conta, data, descricao: desc, categoria: categoria(desc, v), tipo: v > 0 ? "Entrada" : "Saída",
+        valor: Math.round(v * 100) / 100, saldo, documento: String(l.numeroDocumento || "").trim() || null, raw: l });
+      doBloco.set(base, lista);
+    }
+    // mesmo lançamento nos dois blocos: fica a lista maior (cobre lançamentos iguais no mesmo dia)
+    for (const [base, lista] of doBloco) if ((porChave.get(base) || []).length < lista.length) porChave.set(base, lista);
   }
+  const rows: any[] = [];
+  for (const [base, lista] of porChave) lista.forEach((r, i) => rows.push({ id: `${base}-${i + 1}`, ...r }));
+  // ordem dentro do dia na sequência em que o banco mandou (o saldo após cada lançamento segue essa ordem)
+  const porDia = new Map<string, number>();
+  for (const r of rows) { const n = (porDia.get(r.data) || 0) + 1; porDia.set(r.data, n); r.ordem = n; }
   return rows;
 }
 async function bradCred() {
@@ -156,9 +169,15 @@ Deno.serve(async (req) => {
       case "extrato": {
         const banco = BANCOS.includes(b.banco) ? b.banco : "bradesco";
         const desde = new Date(Date.now() - 400 * 864e5).toISOString().slice(0, 10);
-        const rows = await q(db.from("fin_lancamentos")
-          .select("id,banco,conta,data,descricao,categoria,tipo,valor,saldo,documento")
-          .eq("banco", banco).gte("data", desde).order("data", { ascending: true }).order("id", { ascending: true }).limit(10000));
+        // o Supabase devolve no máximo 1000 linhas por consulta: busca em páginas
+        const rows: any[] = [];
+        for (let de = 0; de < 20000; de += 1000) {
+          const pg = await q(db.from("fin_lancamentos")
+            .select("id,banco,conta,data,descricao,categoria,tipo,valor,saldo,documento")
+            .eq("banco", banco).gte("data", desde).order("data", { ascending: true }).order("ordem", { ascending: true, nullsFirst: true }).order("id", { ascending: true }).range(de, de + 999));
+          rows.push(...pg);
+          if (pg.length < 1000) break;
+        }
         const cred = (await credenciais()).find((c) => c.banco === banco);
         return out({ banco, rows, configurado: !!cred?.completo, ambiente: cred?.ambiente });
       }
