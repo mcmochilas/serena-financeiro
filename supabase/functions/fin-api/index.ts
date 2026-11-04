@@ -18,12 +18,12 @@ type Me = { login: string; nome: string; role: string };
 const BANCOS = ["bradesco", "stone"] as const;
 // segredos aceitos por banco (nunca voltam para a tela)
 const SEGREDOS: Record<string, string[]> = {
-  bradesco: ["client_secret", "cert", "cert_senha"],
+  bradesco: ["client_secret"],
   stone: ["api_key"],
 };
 // o que precisa estar preenchido para considerar o banco configurado
 const OBRIG: Record<string, { campos: string[]; segredos: string[] }> = {
-  bradesco: { campos: ["client_id", "agencia", "conta"], segredos: ["client_secret", "cert"] },
+  bradesco: { campos: ["client_id", "agencia", "conta"], segredos: ["client_secret"] },
   stone: { campos: ["client_id"], segredos: ["api_key"] },
 };
 
@@ -48,6 +48,87 @@ function resumoCred(c: any) {
   };
 }
 const credenciais = async () => (await q(db.from("fin_credenciais").select("*").order("banco"))).map(resumoCred);
+
+
+// ---------- Bradesco: API de Saldo e Extrato (manual v2.2.2) ----------
+const BRAD = {
+  producao: { base: "https://openapi.bradesco.com.br", tokens: ["/auth/server-mtls/v2/token", "/auth/server/v1.1/token"] },
+  sandbox: { base: "https://openapisandbox.prebanco.com.br", tokens: ["/auth/server-mtls/v2/token", "/auth/server/v1.1/token"] },
+} as const;
+const curto = (s: string, n = 220) => s.replace(/\s+/g, " ").slice(0, n);
+async function bradToken(amb: "producao" | "sandbox", id: string, secret: string) {
+  const cfg = BRAD[amb], tentativas: string[] = [];
+  for (const path of cfg.tokens) {
+    for (const modo of ["basic", "corpo"]) {
+      const body = new URLSearchParams({ grant_type: "client_credentials" });
+      const headers: Record<string, string> = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" };
+      if (modo === "basic") headers.Authorization = "Basic " + btoa(`${id}:${secret}`);
+      else { body.set("client_id", id); body.set("client_secret", secret); }
+      try {
+        const r = await fetch(cfg.base + path, { method: "POST", headers, body, signal: AbortSignal.timeout(20000) });
+        const txt = await r.text();
+        let j: any = null; try { j = JSON.parse(txt); } catch { /* texto */ }
+        if (r.ok && j?.access_token) return { token: j.access_token as string, via: `${path} (${modo})`, tentativas };
+        tentativas.push(`${path} [${modo}] → HTTP ${r.status}: ${curto(txt) || "(sem corpo)"}`);
+      } catch (e) {
+        tentativas.push(`${path} [${modo}] → falha de conexão: ${curto(String((e as Error)?.message || e))}`);
+      }
+    }
+  }
+  return { token: null, via: "", tentativas };
+}
+const ddmmaaaa = (d: Date) => `${String(d.getUTCDate()).padStart(2, "0")}${String(d.getUTCMonth() + 1).padStart(2, "0")}${d.getUTCFullYear()}`;
+async function bradExtrato(amb: "producao" | "sandbox", token: string, agencia: string, conta: string, ini: Date, fim: Date) {
+  const u = new URL(BRAD[amb].base + "/v1/fornecimento-extratos-contas/extratos");
+  u.search = new URLSearchParams({ agencia, conta, dataInicio: ddmmaaaa(ini), dataFim: ddmmaaaa(fim), tipo: "cc", tipoOperacao: "1" }).toString();
+  const r = await fetch(u, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }, signal: AbortSignal.timeout(30000) });
+  const txt = await r.text();
+  let j: any = null; try { j = JSON.parse(txt); } catch { /* texto */ }
+  return { status: r.status, json: j, texto: curto(txt, 400) };
+}
+const num = (v: unknown) => { const s = String(v ?? "").trim(); if (!s) return 0; return Number(s.replace(/\./g, "").replace(",", ".")) || 0; };
+const dataISO = (s: string) => { const m = String(s || "").match(/(\d{2})\/(\d{2})\/(\d{4})/); return m ? `${m[3]}-${m[2]}-${m[1]}` : null; };
+function categoria(desc: string, valor: number) {
+  const d = desc.toUpperCase();
+  if (/TARIFA|TAR\.|CESTA|PACOTE/.test(d)) return "Tarifas bancárias";
+  if (/PIX/.test(d)) return valor > 0 ? "PIX recebido" : "PIX enviado";
+  if (/TED|DOC|TRANSF/.test(d)) return valor > 0 ? "Transferência recebida" : "Transferência enviada";
+  if (/BOLETO|COBRANCA|LIQUIDACAO|TITULO/.test(d)) return valor > 0 ? "Boletos recebidos" : "Boletos pagos";
+  if (/DARF|DAS|GPS|IMPOSTO|TRIBUTO|SIMPLES/.test(d)) return "Impostos";
+  if (/FOLHA|SALARIO|PAGTO FUNC/.test(d)) return "Pessoal";
+  if (/INVEST|RESG|APLIC|RENTAB|CDB/.test(d)) return "Investimentos";
+  return valor > 0 ? "Outras entradas" : "Outras saídas";
+}
+// Lançamentos do extrato por período (ou, se não vier, dos últimos lançamentos), sem saldo anterior nem lançamentos futuros
+function lancamentos(j: any, conta: string) {
+  const brutos: any[] = [];
+  const per = j?.extratoPorPeriodo?.lstLancamentoMensal;
+  if (Array.isArray(per)) per.forEach((l: any) => { if (!["01", "04", "05"].includes(String(l.tipoLancamento))) brutos.push(l); });
+  const ult = j?.extratoUltimosLancamentos?.listaLancamentos;
+  if (!brutos.length && ult && typeof ult === "object") for (const [k, lista] of Object.entries(ult)) {
+    if (/saldo anterior|futuro/i.test(k) || !Array.isArray(lista)) continue;
+    (lista as any[]).forEach((l) => brutos.push(l));
+  }
+  const vistos = new Map<string, number>(), rows: any[] = [];
+  for (const l of brutos) {
+    const data = dataISO(l.dataLancamento); if (!data) continue;
+    const v = num(l.valorLancamento) * (String(l.sinalLancamento).trim() === "-" ? -1 : 1);
+    if (!v) continue;
+    const saldo = l.valorSaldoAposLancamento ? num(l.valorSaldoAposLancamento) * (String(l.sinalSaldo).trim() === "-" ? -1 : 1) : null;
+    const desc = [String(l.descritivoLancamentoCompleto || l.descritivoLancamentoAbreviado || "").trim(), String(l.segundaLinhalLancamento || "").trim()].filter(Boolean).join(" · ");
+    const base = `brd-${conta}-${data}-${String(l.numeroDocumento || "").trim()}-${String(l.codigoLancamento || "").trim()}-${Math.round(v * 100)}`;
+    const n = (vistos.get(base) || 0) + 1; vistos.set(base, n);
+    rows.push({ id: `${base}-${n}`, banco: "bradesco", conta, data, descricao: desc, categoria: categoria(desc, v), tipo: v > 0 ? "Entrada" : "Saída",
+      valor: Math.round(v * 100) / 100, saldo, documento: String(l.numeroDocumento || "").trim() || null, raw: l });
+  }
+  return rows;
+}
+async function bradCred() {
+  const c = await q(db.from("fin_credenciais").select("*").eq("banco", "bradesco").single());
+  const secret = await q(db.rpc("fin_secret_get", { p_banco: "bradesco", p_nome: "client_secret" }));
+  must(c.client_id && secret && c.agencia && c.conta, "Preencha Client ID, Client Secret, agência e conta do Bradesco antes.", 400);
+  return { amb: c.ambiente as "producao" | "sandbox", id: c.client_id as string, secret: secret as string, agencia: c.agencia as string, conta: c.conta as string };
+}
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
@@ -134,11 +215,27 @@ Deno.serve(async (req) => {
         if (!c.completo) {
           const o = OBRIG[banco];
           const falta = [...o.campos.filter((k) => !(c as any)[k]), ...o.segredos.filter((k) => !c.segredos.includes(k))];
-          ok = false; msg = "Falta preencher: " + falta.map((k) => ({ client_id: "Client ID", agencia: "agência", conta: "conta", client_secret: "Client Secret", cert: "certificado", api_key: "chave privada" } as any)[k] || k).join(", ") + ".";
+          ok = false; msg = "Falta preencher: " + falta.map((k) => ({ client_id: "Client ID", agencia: "agência", conta: "conta", client_secret: "Client Secret", api_key: "chave privada" } as any)[k] || k).join(", ") + ".";
+        } else if (banco === "bradesco") {
+          const cr = await bradCred();
+          const tk = await bradToken(cr.amb, cr.id, cr.secret);
+          if (!tk.token) {
+            ok = false; msg = "O Bradesco não liberou o acesso (token). Respostas: " + tk.tentativas.join(" | ");
+          } else {
+            const hoje = new Date(), ini = new Date(Date.now() - 6 * 864e5);
+            const ex = await bradExtrato(cr.amb, tk.token, cr.agencia, cr.conta, ini, hoje);
+            if (ex.status === 200) {
+              const n = lancamentos(ex.json, cr.conta).length;
+              const ret = ex.json?.extratoPorPeriodo || ex.json?.extratoUltimosLancamentos || {};
+              ok = true; msg = `Conexão OK (token via ${tk.via}). Extrato dos últimos 7 dias: ${n} lançamentos. ${ret.mensagem ? "Banco: " + String(ret.mensagem).trim() : ""}`;
+            } else {
+              ok = false; msg = `Token OK (via ${tk.via}), mas a consulta do extrato voltou HTTP ${ex.status}: ${ex.texto || "(sem corpo)"}`;
+            }
+          }
         } else {
-          ok = null;
-          msg = "Credenciais completas e guardadas com segurança. A conexão com o banco é ativada na próxima etapa, junto com a sincronização do extrato.";
+          ok = null; msg = "Credenciais guardadas. A conexão com a Stone entra numa próxima etapa.";
         }
+        await log(me.login, `Teste ${banco}: ${msg}`);
         await q(db.from("fin_credenciais").update({ teste_em: new Date().toISOString(), teste_ok: ok, teste_msg: msg }).eq("banco", banco));
         return out({ bancos: await credenciais() });
       }
@@ -152,6 +249,22 @@ Deno.serve(async (req) => {
         await q(db.from("fin_credenciais").update({ client_id: null, agencia: null, conta: null, cert_nome: null, secrets: {}, atualizado: new Date().toISOString(), atualizado_por: me.login, teste_em: null, teste_ok: null, teste_msg: null }).eq("banco", banco));
         await log(me.login, `${me.nome} apagou as credenciais ${banco}`);
         return out({ bancos: await credenciais() });
+      }
+
+
+      case "sync": {
+        must(admin, "Só administradores sincronizam o extrato.");
+        const dias = Math.min(365, Math.max(1, Number(b.dias) || 90));
+        const cr = await bradCred();
+        const tk = await bradToken(cr.amb, cr.id, cr.secret);
+        if (!tk.token) throw new Erro("O Bradesco não liberou o acesso (token). Use Testar conexão para ver a resposta do banco.", 502);
+        const ex = await bradExtrato(cr.amb, tk.token, cr.agencia, cr.conta, new Date(Date.now() - (dias - 1) * 864e5), new Date());
+        if (ex.status !== 200) throw new Erro(`O Bradesco respondeu HTTP ${ex.status}: ${ex.texto || "(sem corpo)"}`, 502);
+        const rows = lancamentos(ex.json, cr.conta);
+        for (let i = 0; i < rows.length; i += 500) await q(db.from("fin_lancamentos").upsert(rows.slice(i, i + 500)));
+        await q(db.from("fin_credenciais").update({ teste_em: new Date().toISOString(), teste_ok: true, teste_msg: `Sincronizado: ${rows.length} lançamentos dos últimos ${dias} dias.` }).eq("banco", "bradesco"));
+        await log(me.login, `${me.nome} sincronizou o extrato Bradesco: ${rows.length} lançamentos (${dias} dias)`);
+        return out({ ok: true, n: rows.length, dias });
       }
 
       case "users": {

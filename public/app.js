@@ -91,6 +91,12 @@ function topo() {
 }
 async function sair() { try { await api('logout'); } catch (e) { /* ignora */ } localStorage.removeItem(TK); S.me = null; render(); }
 
+async function sincronizar(btn, dias) {
+  const t = btn.textContent; btn.disabled = true; btn.textContent = 'Sincronizando…';
+  try { const r = await api('sync', { dias }); S.ext = null; S.cred = null; toast(`${r.n} lançamentos sincronizados (últimos ${r.dias} dias).`); render(); }
+  catch (e) { toast(e.message, true); btn.disabled = false; btn.textContent = t; }
+}
+
 /* ---------- extrato: cálculos ---------- */
 function ordenados(rows) { return rows.map((r) => ({ ...r, valor: Number(r.valor), saldo: r.saldo == null ? null : Number(r.saldo), data: String(r.data).slice(0, 10) })); }
 function corte(rows) {
@@ -141,17 +147,20 @@ function telaExtrato() {
     h('div', { class: 'chips', role: 'group', 'aria-label': 'Conta' }, h('span', { class: 'lbl' }, 'Conta'),
       h('button', { type: 'button', 'aria-pressed': 'true' }, 'Bradesco · conta corrente PJ'),
       h('button', { type: 'button', disabled: true }, 'Stone ', h('small', {}, '· em breve'))),
-    rows.length ? h('div', { class: 'seg', role: 'group', 'aria-label': 'Período' },
-      Object.keys(DIAS).map((p) => h('button', { type: 'button', 'aria-pressed': String(S.periodo === p), onclick: () => { S.periodo = p; render(); } }, `${DIAS[p]} dias`))) : null));
+    rows.length ? h('div', { class: 'chips' },
+      S.me.role === 'admin' ? h('button', { type: 'button', class: 'btn sec small', onclick: (ev) => sincronizar(ev.currentTarget, 90) }, 'Sincronizar') : null,
+      h('div', { class: 'seg', role: 'group', 'aria-label': 'Período' },
+        Object.keys(DIAS).map((p) => h('button', { type: 'button', 'aria-pressed': String(S.periodo === p), onclick: () => { S.periodo = p; render(); } }, `${DIAS[p]} dias`)))) : null));
 
   if (!rows.length) {
     const admin = S.me.role === 'admin';
     wrap.append(h('div', { class: 'card empty' },
       h('h2', {}, 'Ainda não há lançamentos'),
       h('p', {}, S.ext.configurado
-        ? 'As credenciais do Bradesco já estão guardadas. O extrato começa a aparecer aqui assim que a sincronização com o banco for ativada.'
-        : 'Para puxar o extrato, cadastre em Configurações › APIs o Client ID, o Client Secret, a agência e conta e o certificado digital usado para criar a credencial no Bradesco.'),
-      admin && !S.ext.configurado ? h('button', { class: 'btn', type: 'button', onclick: () => { S.cfg = 'apis'; ir('configuracoes'); } }, 'Abrir configurações de API') : null));
+        ? 'As credenciais do Bradesco já estão guardadas. Clique em sincronizar para puxar o extrato do banco.'
+        : 'Para puxar o extrato, cadastre em Configurações › APIs o Client ID, o Client Secret, a agência e a conta do Bradesco.'),
+      admin && !S.ext.configurado ? h('button', { class: 'btn', type: 'button', onclick: () => { S.cfg = 'apis'; ir('configuracoes'); } }, 'Abrir configurações de API') : null,
+      admin && S.ext.configurado ? h('button', { class: 'btn', type: 'button', onclick: (ev) => sincronizar(ev.currentTarget, 90) }, 'Sincronizar últimos 90 dias') : null));
     return wrap;
   }
 
@@ -312,9 +321,9 @@ function painelVazio() {
 
 const BANCO_UI = {
   bradesco: {
-    nome: 'Bradesco', sub: 'API de Saldo e Extrato · Client ID e Client Secret gerados com o certificado digital da empresa',
+    nome: 'Bradesco', sub: 'API de Saldo e Extrato · Client ID e Client Secret gerados no portal Bradesco Developers',
     campos: [['client_id', 'Client ID', 'text', 'Fornecido pelo Bradesco ao cadastrar a aplicação'], ['agencia', 'Agência (sem dígito)', 'text', 'ex.: 3995'], ['conta', 'Conta (sem dígito)', 'text', 'ex.: 75557']],
-    segredos: [['client_secret', 'Client Secret', 'password'], ['cert', 'Certificado digital (.pfx)', 'file', 'O mesmo certificado usado para criar a credencial no portal do Bradesco'], ['cert_senha', 'Senha do certificado', 'password']],
+    segredos: [['client_secret', 'Client Secret', 'password']],
   },
   stone: {
     nome: 'Stone', sub: 'API Stone Conta · extrato e saldo da conta Stone',
@@ -325,7 +334,7 @@ const BANCO_UI = {
 function painelApis() {
   const p = h('section', { class: 'panel' }, h('h2', {}, 'APIs'),
     h('p', {}, 'Credenciais usadas para puxar o extrato de cada banco. Cada banco libera essas credenciais no seu portal de desenvolvedores.'),
-    h('div', { class: 'info' }, 'As chaves e o certificado são criptografados e guardados no cofre do servidor. Depois de salvos, eles não aparecem mais aqui: os campos secretos ficam em branco. Para trocar, é só digitar ou escolher um novo.'));
+    h('div', { class: 'info' }, 'As chaves são criptografadas e guardadas no cofre do servidor. Depois de salvas, elas não aparecem mais aqui: os campos secretos ficam em branco. Para trocar, é só digitar ou escolher um novo.'));
   if (!S.cred) {
     p.append(h('div', { class: 'loading' }, 'Carregando…'));
     api('cred_get').then((r) => { S.cred = r; render(); }).catch((e) => toast(e.message, true));
@@ -387,7 +396,10 @@ function cardBanco(c, admin) {
       h('span', { class: 'badge ' + (c.completo ? 'on' : 'off') }, c.completo ? 'Configurado' : 'Não configurado')),
     h('div', { class: 'fields' }, h('label', { class: 'field' }, 'Ambiente', ambiente), campos, segredos),
     ro ? h('p', { class: 'meta' }, 'Só administradores podem alterar as credenciais.') : null,
-    h('div', { class: 'actions' }, salvar, testar, apagar, msg),
+    h('div', { class: 'actions' }, salvar, testar,
+      c.banco === 'bradesco' && admin && c.completo ? h('button', { class: 'btn sec', type: 'button', onclick: (ev) => sincronizar(ev.currentTarget, 90) }, 'Sincronizar extrato') : null,
+      apagar),
+    h('p', { class: 'meta', style: 'word-break:break-word;line-height:1.5' }, msg),
     c.atualizado ? h('p', { class: 'meta' }, `Última alteração em ${quando(c.atualizado)} por ${c.atualizado_por}.`) : null);
 }
 
