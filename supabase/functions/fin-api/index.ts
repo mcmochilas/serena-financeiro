@@ -18,12 +18,12 @@ type Me = { login: string; nome: string; role: string };
 const BANCOS = ["bradesco", "stone"] as const;
 // segredos aceitos por banco (nunca voltam para a tela)
 const SEGREDOS: Record<string, string[]> = {
-  bradesco: ["client_secret"],
+  bradesco: ["client_secret", "cert", "cert_senha"],
   stone: ["api_key"],
 };
 // o que precisa estar preenchido para considerar o banco configurado
 const OBRIG: Record<string, { campos: string[]; segredos: string[] }> = {
-  bradesco: { campos: ["client_id", "agencia", "conta"], segredos: ["client_secret"] },
+  bradesco: { campos: ["client_id", "agencia", "conta"], segredos: ["client_secret", "cert"] },
   stone: { campos: ["client_id"], segredos: ["api_key"] },
 };
 
@@ -51,43 +51,30 @@ const credenciais = async () => (await q(db.from("fin_credenciais").select("*").
 
 
 // ---------- Bradesco: API de Saldo e Extrato (manual v2.2.2) ----------
-const BRAD = {
-  // endereços de token conforme a collection oficial "Saldo e extrato | cliente"
-  producao: { base: "https://openapi.bradesco.com.br", tokens: ["/auth/server-mtls/v1/token"] },
-  sandbox: { base: "https://openapisandbox.prebanco.com.br", tokens: ["/auth/server-mtls/v2/token"] },
-} as const;
-const curto = (s: string, n = 220) => s.replace(/\s+/g, " ").slice(0, n);
-async function bradToken(amb: "producao" | "sandbox", id: string, secret: string) {
-  const cfg = BRAD[amb], tentativas: string[] = [];
-  for (const path of cfg.tokens) {
-    for (const modo of ["corpo", "basic"]) {
-      const body = new URLSearchParams({ grant_type: "client_credentials" });
-      const headers: Record<string, string> = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" };
-      if (modo === "basic") headers.Authorization = "Basic " + btoa(`${id}:${secret}`);
-      else { body.set("client_id", id); body.set("client_secret", secret); }
-      try {
-        const r = await fetch(cfg.base + path, { method: "POST", headers, body, signal: AbortSignal.timeout(20000) });
-        const txt = await r.text();
-        let j: any = null; try { j = JSON.parse(txt); } catch { /* texto */ }
-        if (r.ok && j?.access_token) return { token: j.access_token as string, via: `${path} (${modo})`, tentativas };
-        tentativas.push(`${path} [${modo}] → HTTP ${r.status}: ${curto(txt) || "(sem corpo)"}`);
-      } catch (e) {
-        tentativas.push(`${path} [${modo}] → falha de conexão: ${curto(String((e as Error)?.message || e))}`);
-      }
-    }
-  }
-  return { token: null, via: "", tentativas };
-}
+// O Bradesco exige o certificado da empresa na própria conexão (mTLS). Essa parte roda numa função
+// da Vercel (/api/bradesco), que esta API chama com uma chave interna guardada no Vault.
+const PROXY = "https://serena-financeiro.vercel.app/api/bradesco";
+const curto = (s: string, n = 220) => String(s || "").replace(/\s+/g, " ").slice(0, n);
 const ddmmaaaa = (d: Date) => `${String(d.getUTCDate()).padStart(2, "0")}${String(d.getUTCMonth() + 1).padStart(2, "0")}${d.getUTCFullYear()}`;
-async function bradExtrato(amb: "producao" | "sandbox", token: string, agencia: string, conta: string, ini: Date, fim: Date) {
-  const u = new URL(BRAD[amb].base + "/v1/fornecimento-extratos-contas/extratos");
-  u.search = new URLSearchParams({ agencia, conta, tipo: "cc", dataInicio: ddmmaaaa(ini), dataFim: ddmmaaaa(fim) }).toString();
-  let r = await fetch(u, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }, signal: AbortSignal.timeout(30000) });
-  // a collection manda o token sem o prefixo Bearer: tenta assim se o banco recusar
-  if (r.status === 401 || r.status === 403) r = await fetch(u, { headers: { Authorization: token, Accept: "application/json" }, signal: AbortSignal.timeout(30000) });
-  const txt = await r.text();
-  let j: any = null; try { j = JSON.parse(txt); } catch { /* texto */ }
-  return { status: r.status, json: j, texto: curto(txt, 400) };
+async function bradesco(cr: Awaited<ReturnType<typeof bradCred>>, ini: Date, fim: Date) {
+  const key = await q(db.rpc("fin_proxy_key"));
+  must(key, "Chave interna da ponte com o Bradesco não configurada.", 500);
+  let r: Response;
+  try {
+    r = await fetch(PROXY, {
+      method: "POST", headers: { "Content-Type": "application/json", "x-fin-proxy": key as string }, signal: AbortSignal.timeout(55000),
+      body: JSON.stringify({ amb: cr.amb, client_id: cr.id, client_secret: cr.secret, pfx: cr.pfx, senha: cr.senha, agencia: cr.agencia, conta: cr.conta, dataInicio: ddmmaaaa(ini), dataFim: ddmmaaaa(fim) }),
+    });
+  } catch (e) { return { etapa: "ponte", ok: false, texto: "Sem resposta da ponte na Vercel: " + curto(String((e as Error)?.message || e)) } as any; }
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !j) return { etapa: "ponte", ok: false, texto: `A ponte na Vercel respondeu HTTP ${r.status}${j?.erro ? ": " + j.erro : ""}` } as any;
+  return j as { etapa: string; ok: boolean; status?: number; texto?: string; via?: string; json?: any };
+}
+function explica(x: any) {
+  if (x.etapa === "certificado") return x.texto;
+  if (x.etapa === "token") return `O Bradesco não liberou o acesso (token): HTTP ${x.status} ${x.texto}`;
+  if (x.etapa === "extrato") return `Acesso liberado, mas a consulta do extrato voltou HTTP ${x.status}: ${x.texto}`;
+  return x.texto || "Falha desconhecida.";
 }
 const num = (v: unknown) => { const s = String(v ?? "").trim(); if (!s) return 0; return Number(s.replace(/\./g, "").replace(",", ".")) || 0; };
 const dataISO = (s: string) => { const m = String(s || "").match(/(\d{2})\/(\d{2})\/(\d{4})/); return m ? `${m[3]}-${m[2]}-${m[1]}` : null; };
@@ -128,9 +115,10 @@ function lancamentos(j: any, conta: string) {
 }
 async function bradCred() {
   const c = await q(db.from("fin_credenciais").select("*").eq("banco", "bradesco").single());
-  const secret = await q(db.rpc("fin_secret_get", { p_banco: "bradesco", p_nome: "client_secret" }));
-  must(c.client_id && secret && c.agencia && c.conta, "Preencha Client ID, Client Secret, agência e conta do Bradesco antes.", 400);
-  return { amb: c.ambiente as "producao" | "sandbox", id: c.client_id as string, secret: secret as string, agencia: c.agencia as string, conta: c.conta as string };
+  const sec = (n: string) => q(db.rpc("fin_secret_get", { p_banco: "bradesco", p_nome: n }));
+  const [secret, pfx, senha] = await Promise.all([sec("client_secret"), sec("cert"), sec("cert_senha")]);
+  must(c.client_id && secret && pfx && c.agencia && c.conta, "Preencha Client ID, Client Secret, certificado, agência e conta do Bradesco antes.", 400);
+  return { amb: c.ambiente as "producao" | "sandbox", id: c.client_id as string, secret: secret as string, pfx: pfx as string, senha: (senha as string) || "", agencia: c.agencia as string, conta: c.conta as string };
 }
 
 Deno.serve(async (req) => {
@@ -218,23 +206,15 @@ Deno.serve(async (req) => {
         if (!c.completo) {
           const o = OBRIG[banco];
           const falta = [...o.campos.filter((k) => !(c as any)[k]), ...o.segredos.filter((k) => !c.segredos.includes(k))];
-          ok = false; msg = "Falta preencher: " + falta.map((k) => ({ client_id: "Client ID", agencia: "agência", conta: "conta", client_secret: "Client Secret", api_key: "chave privada" } as any)[k] || k).join(", ") + ".";
+          ok = false; msg = "Falta preencher: " + falta.map((k) => ({ client_id: "Client ID", agencia: "agência", conta: "conta", client_secret: "Client Secret", cert: "certificado (.pfx)", api_key: "chave privada" } as any)[k] || k).join(", ") + ".";
         } else if (banco === "bradesco") {
           const cr = await bradCred();
-          const tk = await bradToken(cr.amb, cr.id, cr.secret);
-          if (!tk.token) {
-            ok = false; msg = "O Bradesco não liberou o acesso (token). Respostas: " + tk.tentativas.join(" | ");
-          } else {
-            const hoje = new Date(), ini = new Date(Date.now() - 6 * 864e5);
-            const ex = await bradExtrato(cr.amb, tk.token, cr.agencia, cr.conta, ini, hoje);
-            if (ex.status === 200) {
-              const n = lancamentos(ex.json, cr.conta).length;
-              const ret = ex.json?.extratoPorPeriodo || ex.json?.extratoUltimosLancamentos || {};
-              ok = true; msg = `Conexão OK (token via ${tk.via}). Extrato dos últimos 7 dias: ${n} lançamentos. ${ret.mensagem ? "Banco: " + String(ret.mensagem).trim() : ""}`;
-            } else {
-              ok = false; msg = `Token OK (via ${tk.via}), mas a consulta do extrato voltou HTTP ${ex.status}: ${ex.texto || "(sem corpo)"}`;
-            }
-          }
+          const x = await bradesco(cr, new Date(Date.now() - 6 * 864e5), new Date());
+          if (x.ok) {
+            const n = lancamentos(x.json, cr.conta).length;
+            const ret = x.json?.extratoPorPeriodo || x.json?.extratoUltimosLancamentos || {};
+            ok = true; msg = `Conexão OK. Extrato dos últimos 7 dias: ${n} lançamentos.${ret.mensagem ? " Banco: " + String(ret.mensagem).trim() : ""}`;
+          } else { ok = false; msg = explica(x); }
         } else {
           ok = null; msg = "Credenciais guardadas. A conexão com a Stone entra numa próxima etapa.";
         }
@@ -259,11 +239,9 @@ Deno.serve(async (req) => {
         must(admin, "Só administradores sincronizam o extrato.");
         const dias = Math.min(365, Math.max(1, Number(b.dias) || 90));
         const cr = await bradCred();
-        const tk = await bradToken(cr.amb, cr.id, cr.secret);
-        if (!tk.token) throw new Erro("O Bradesco não liberou o acesso (token). Use Testar conexão para ver a resposta do banco.", 502);
-        const ex = await bradExtrato(cr.amb, tk.token, cr.agencia, cr.conta, new Date(Date.now() - (dias - 1) * 864e5), new Date());
-        if (ex.status !== 200) throw new Erro(`O Bradesco respondeu HTTP ${ex.status}: ${ex.texto || "(sem corpo)"}`, 502);
-        const rows = lancamentos(ex.json, cr.conta);
+        const x = await bradesco(cr, new Date(Date.now() - (dias - 1) * 864e5), new Date());
+        if (!x.ok) throw new Erro(explica(x), 502);
+        const rows = lancamentos(x.json, cr.conta);
         for (let i = 0; i < rows.length; i += 500) await q(db.from("fin_lancamentos").upsert(rows.slice(i, i + 500)));
         await q(db.from("fin_credenciais").update({ teste_em: new Date().toISOString(), teste_ok: true, teste_msg: `Sincronizado: ${rows.length} lançamentos dos últimos ${dias} dias.` }).eq("banco", "bradesco"));
         await log(me.login, `${me.nome} sincronizou o extrato Bradesco: ${rows.length} lançamentos (${dias} dias)`);

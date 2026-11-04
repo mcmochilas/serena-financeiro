@@ -158,7 +158,7 @@ function telaExtrato() {
       h('h2', {}, 'Ainda não há lançamentos'),
       h('p', {}, S.ext.configurado
         ? 'As credenciais do Bradesco já estão guardadas. Clique em sincronizar para puxar o extrato do banco.'
-        : 'Para puxar o extrato, cadastre em Configurações › APIs o Client ID, o Client Secret, a agência e a conta do Bradesco.'),
+        : 'Para puxar o extrato, cadastre em Configurações › APIs o Client ID, o Client Secret, a agência, a conta e o certificado digital (.pfx) do Bradesco.'),
       admin && !S.ext.configurado ? h('button', { class: 'btn', type: 'button', onclick: () => { S.cfg = 'apis'; ir('configuracoes'); } }, 'Abrir configurações de API') : null,
       admin && S.ext.configurado ? h('button', { class: 'btn', type: 'button', onclick: (ev) => sincronizar(ev.currentTarget, 90) }, 'Sincronizar últimos 90 dias') : null));
     return wrap;
@@ -323,7 +323,7 @@ const BANCO_UI = {
   bradesco: {
     nome: 'Bradesco', sub: 'API de Saldo e Extrato · Client ID e Client Secret gerados no portal Bradesco Developers',
     campos: [['client_id', 'Client ID', 'text', 'Fornecido pelo Bradesco ao cadastrar a aplicação'], ['agencia', 'Agência (sem dígito)', 'text', 'ex.: 3995'], ['conta', 'Conta (sem dígito)', 'text', 'ex.: 75557']],
-    segredos: [['client_secret', 'Client Secret', 'password']],
+    segredos: [['client_secret', 'Client Secret', 'password'], ['cert', 'Certificado digital A1 (.pfx)', 'file', 'O arquivo .pfx (ou .p12) do certificado usado para criar a credencial'], ['cert_senha', 'Senha do certificado', 'password']],
   },
   stone: {
     nome: 'Stone', sub: 'API Stone Conta · extrato e saldo da conta Stone',
@@ -334,7 +334,7 @@ const BANCO_UI = {
 function painelApis() {
   const p = h('section', { class: 'panel' }, h('h2', {}, 'APIs'),
     h('p', {}, 'Credenciais usadas para puxar o extrato de cada banco. Cada banco libera essas credenciais no seu portal de desenvolvedores.'),
-    h('div', { class: 'info' }, 'As chaves são criptografadas e guardadas no cofre do servidor. Depois de salvas, elas não aparecem mais aqui: os campos secretos ficam em branco. Para trocar, é só digitar ou escolher um novo.'));
+    h('div', { class: 'info' }, 'As chaves e o certificado são criptografados e guardados no cofre do servidor. Depois de salvos, eles não aparecem mais aqui: os campos secretos ficam em branco. Para trocar, é só digitar ou escolher um novo.'));
   if (!S.cred) {
     p.append(h('div', { class: 'loading' }, 'Carregando…'));
     api('cred_get').then((r) => { S.cred = r; render(); }).catch((e) => toast(e.message, true));
