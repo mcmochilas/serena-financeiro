@@ -121,11 +121,22 @@ module.exports = async (req, res) => {
   }
   if (b.so_token) { res.status(200).json({ etapa: 'token', ok: true, via: TOKEN[amb] }); return; }
 
+  // saldo do dia (tipoOperacao 2 = conta corrente + Invest Fácil)
+  let saldo = null;
+  if (b.saldo) {
+    const qs = new URLSearchParams({ agencia: String(b.agencia || ''), conta: String(b.conta || ''), tipoOperacao: '2' });
+    const urlS = BASE[amb] + '/v1/fornecimento-saldos-contas/saldos?' + qs.toString();
+    let sr = await pedir(agent, urlS, { headers: { Authorization: 'Bearer ' + tj.access_token, Accept: 'application/json' } });
+    if (sr.status === 401 || sr.status === 403) sr = await pedir(agent, urlS, { headers: { Authorization: tj.access_token, Accept: 'application/json' } });
+    saldo = { status: sr.status, json: sr.status === 200 ? json(sr.texto) : null, texto: sr.status === 200 ? '' : curto(sr.texto, 300) };
+    if (b.so_saldo) { res.status(200).json({ etapa: 'saldo', ok: sr.status === 200, saldo }); return; }
+  }
+
   // 2) extrato
   const q = new URLSearchParams({ agencia: String(b.agencia || ''), conta: String(b.conta || ''), tipo: 'cc', dataInicio: String(b.dataInicio || ''), dataFim: String(b.dataFim || '') });
   const url = BASE[amb] + '/v1/fornecimento-extratos-contas/extratos?' + q.toString();
   let e = await pedir(agent, url, { headers: { Authorization: 'Bearer ' + tj.access_token, Accept: 'application/json' } });
   if (e.status === 401 || e.status === 403) e = await pedir(agent, url, { headers: { Authorization: tj.access_token, Accept: 'application/json' } });
   const ej = json(e.texto);
-  res.status(200).json({ etapa: 'extrato', ok: e.status === 200 && !!ej, via: TOKEN[amb], status: e.status, json: e.status === 200 ? ej : null, texto: e.status === 200 ? '' : curto(e.texto, 400) || '(sem corpo)' });
+  res.status(200).json({ etapa: 'extrato', ok: e.status === 200 && !!ej, via: TOKEN[amb], status: e.status, json: e.status === 200 ? ej : null, texto: e.status === 200 ? '' : curto(e.texto, 400) || '(sem corpo)', saldo });
 };
