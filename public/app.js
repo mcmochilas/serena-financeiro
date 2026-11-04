@@ -93,7 +93,7 @@ async function sair() { try { await api('logout'); } catch (e) { /* ignora */ } 
 
 async function sincronizar(btn, dias) {
   const t = btn.textContent; btn.disabled = true; btn.textContent = 'Sincronizando…';
-  try { const r = await api('sync', { dias }); S.ext = null; S.cred = null; toast(`${r.n} lançamentos sincronizados (últimos ${r.dias} dias).`); render(); }
+  try { const r = await api('sync', { dias }); S.ext = null; S.cred = null; toast(`${r.n} lançamentos sincronizados${r.saldo != null ? ' · saldo ' + brl.format(r.saldo) : ''}.`); render(); }
   catch (e) { toast(e.message, true); btn.disabled = false; btn.textContent = t; }
 }
 
@@ -167,7 +167,14 @@ function telaExtrato() {
   const r = resumo(rows);
   const tile = (k, v, s, cls) => h('div', { class: 'card tile' }, h('div', { class: 'k' }, k), h('b', { class: 'v ' + (cls || '') }, v), h('div', { class: 's' }, s));
   wrap.append(h('section', { class: 'tiles' },
-    tile('Saldo atual', brl.format(r.saldo_final), `Era ${brl.format(r.saldo_inicial)} em ${diaAno(r.inicio)}`),
+    (() => {
+      const sd = S.ext.saldo;
+      if (!sd || sd.total == null) return tile('Saldo atual', brl.format(r.saldo_final), `Era ${brl.format(r.saldo_inicial)} em ${diaAno(r.inicio)}`);
+      const it = (cod) => (sd.itens || []).find((i) => i.codigo === cod && i.secao === 'saldoCC');
+      const cc = it(998), inv = (sd.itens || []).filter((i) => i.secao !== 'saldoCC' && i.valor).reduce((t, i) => t + i.valor, 0);
+      const partes = [cc ? `Conta ${brl.format(cc.valor)}` : null, inv ? `Invest Fácil ${brl.format(inv)}` : null].filter(Boolean).join(' + ');
+      return tile('Saldo atual', brl.format(Number(sd.total)), `${partes ? partes + ' · ' : ''}consultado ${quando(sd.em)}`);
+    })(),
     tile(`Entradas · últimos ${DIAS[S.periodo]} dias`, brl.format(r.entradas), 'PIX, boletos, TEDs e repasses'),
     tile(`Saídas · últimos ${DIAS[S.periodo]} dias`, brl.format(r.saidas), 'Fornecedores, folha, impostos e despesas'),
     tile('Resultado do período', brl.format(r.resultado), `Entradas menos saídas · ${int.format(r.n)} lançamentos`, r.resultado >= 0 ? 'pos' : 'neg')));

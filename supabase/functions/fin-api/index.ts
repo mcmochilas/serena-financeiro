@@ -56,19 +56,19 @@ const credenciais = async () => (await q(db.from("fin_credenciais").select("*").
 const PROXY = "https://serena-financeiro.vercel.app/api/bradesco";
 const curto = (s: string, n = 220) => String(s || "").replace(/\s+/g, " ").slice(0, n);
 const ddmmaaaa = (d: Date) => `${String(d.getUTCDate()).padStart(2, "0")}${String(d.getUTCMonth() + 1).padStart(2, "0")}${d.getUTCFullYear()}`;
-async function bradesco(cr: Awaited<ReturnType<typeof bradCred>>, ini: Date, fim: Date) {
+async function bradesco(cr: Awaited<ReturnType<typeof bradCred>>, ini: Date, fim: Date, extra: Record<string, unknown> = {}) {
   const key = await q(db.rpc("fin_proxy_key"));
   must(key, "Chave interna da ponte com o Bradesco não configurada.", 500);
   let r: Response;
   try {
     r = await fetch(PROXY, {
       method: "POST", headers: { "Content-Type": "application/json", "x-fin-proxy": key as string }, signal: AbortSignal.timeout(55000),
-      body: JSON.stringify({ amb: cr.amb, client_id: cr.id, client_secret: cr.secret, pfx: cr.pfx, senha: cr.senha, agencia: cr.agencia, conta: cr.conta, dataInicio: ddmmaaaa(ini), dataFim: ddmmaaaa(fim) }),
+      body: JSON.stringify({ amb: cr.amb, client_id: cr.id, client_secret: cr.secret, pfx: cr.pfx, senha: cr.senha, agencia: cr.agencia, conta: cr.conta, dataInicio: ddmmaaaa(ini), dataFim: ddmmaaaa(fim), ...extra }),
     });
   } catch (e) { return { etapa: "ponte", ok: false, texto: "Sem resposta da ponte na Vercel: " + curto(String((e as Error)?.message || e)) } as any; }
   const j = await r.json().catch(() => null);
   if (!r.ok || !j) return { etapa: "ponte", ok: false, texto: `A ponte na Vercel respondeu HTTP ${r.status}${j?.erro ? ": " + j.erro : ""}` } as any;
-  return j as { etapa: string; ok: boolean; status?: number; texto?: string; via?: string; json?: any };
+  return j as { etapa: string; ok: boolean; status?: number; texto?: string; via?: string; json?: any; saldo?: any };
 }
 function explica(x: any) {
   if (x.etapa === "certificado") return x.texto;
@@ -93,6 +93,25 @@ function categoria(desc: string, valor: number) {
   if (/FOLHA|SALARIO|PAGTO FUNC/.test(d)) return "Pessoal";
   if (/INVEST|RESG|APLIC|RENTAB|CDB/.test(d)) return "Investimentos";
   return valor > 0 ? "Outras entradas" : "Outras saídas";
+}
+// Saldo do dia (API de Saldos): junta as linhas de produto de todos os blocos (saldoCC, saldoAplicacaoCC...)
+function saldoItens(j: any) {
+  const itens: { secao: string; nome: string; codigo: number; valor: number }[] = [];
+  const andar = (x: any, secao: string) => {
+    if (Array.isArray(x)) { x.forEach((y) => andar(y, secao)); return; }
+    if (!x || typeof x !== "object") return;
+    if ("nomeProduto" in x) {
+      const nome = String(x.nomeProduto || "").trim();
+      if (nome && String(x.valorLancamento ?? "").trim() !== "" && !/LINHA EM BRANCO/i.test(nome))
+        itens.push({ secao, nome, codigo: Number(x.codigoProduto), valor: num(x.valorLancamento) * (String(x.sinalSaldo).trim() === "-" ? -1 : 1) });
+      return;
+    }
+    for (const [k, v] of Object.entries(x)) andar(v, /^saldo/i.test(k) ? k : secao);
+  };
+  andar(j, "");
+  const doCC = itens.filter((i) => i.secao === "saldoCC");
+  const total = (doCC.find((i) => i.codigo === 984) || doCC.find((i) => i.codigo === 995) || itens.find((i) => i.codigo === 984 || i.codigo === 995))?.valor ?? null;
+  return { itens, total };
 }
 // Junta os lançamentos do extrato por período (dias já fechados) com os últimos lançamentos e os
 // lançamentos do dia (dias recentes e hoje). Saldo anterior e lançamentos futuros ficam de fora.
@@ -179,7 +198,8 @@ Deno.serve(async (req) => {
           if (pg.length < 1000) break;
         }
         const cred = (await credenciais()).find((c) => c.banco === banco);
-        return out({ banco, rows, configurado: !!cred?.completo, ambiente: cred?.ambiente });
+        const saldo = (await q(db.from("fin_saldos").select("em,total,itens").eq("banco", banco).order("em", { ascending: false }).limit(1)))[0] || null;
+        return out({ banco, rows, saldo, configurado: !!cred?.completo, ambiente: cred?.ambiente });
       }
 
       case "cred_get":
@@ -263,13 +283,17 @@ Deno.serve(async (req) => {
         must(admin, "Só administradores sincronizam o extrato.");
         const dias = Math.min(365, Math.max(1, Number(b.dias) || 90));
         const cr = await bradCred();
-        const x = await bradesco(cr, new Date(Date.now() - (dias - 1) * 864e5), new Date());
+        const x = await bradesco(cr, new Date(Date.now() - (dias - 1) * 864e5), new Date(), { saldo: true });
         if (!x.ok) throw new Erro(explica(x), 502);
         const rows = lancamentos(x.json, cr.conta);
+        if (x.saldo?.json) {
+          const sd = saldoItens(x.saldo.json);
+          await q(db.from("fin_saldos").insert({ banco: "bradesco", conta: cr.conta, total: sd.total, itens: sd.itens, raw: x.saldo.json }));
+        }
         for (let i = 0; i < rows.length; i += 500) await q(db.from("fin_lancamentos").upsert(rows.slice(i, i + 500)));
         await q(db.from("fin_credenciais").update({ teste_em: new Date().toISOString(), teste_ok: true, teste_msg: `Sincronizado: ${rows.length} lançamentos dos últimos ${dias} dias.` }).eq("banco", "bradesco"));
         await log(me.login, `${me.nome} sincronizou o extrato Bradesco: ${rows.length} lançamentos (${dias} dias)`);
-        return out({ ok: true, n: rows.length, dias });
+        return out({ ok: true, n: rows.length, dias, saldo: x.saldo?.json ? saldoItens(x.saldo.json).total : null, saldo_erro: x.saldo && !x.saldo.json ? `HTTP ${x.saldo.status}: ${x.saldo.texto}` : null });
       }
 
       case "users": {
