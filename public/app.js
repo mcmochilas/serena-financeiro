@@ -93,7 +93,7 @@ async function sair() { try { await api('logout'); } catch (e) { /* ignora */ } 
 
 async function sincronizar(btn, dias) {
   const t = btn.textContent; btn.disabled = true; btn.textContent = 'Sincronizando…';
-  try { const r = await api('sync', { dias }); S.ext = null; S.cred = null; toast(`${r.n} lançamentos sincronizados${r.saldo != null ? ' · saldo ' + brl.format(r.saldo) : ''}.`); render(); }
+  try { const r = await api('sync', { dias }); S.ext = null; S.cred = null; toast(`${r.n} lançamentos sincronizados.`); render(); }
   catch (e) { toast(e.message, true); btn.disabled = false; btn.textContent = t; }
 }
 
@@ -171,9 +171,11 @@ function telaExtrato() {
       const sd = S.ext.saldo;
       if (!sd || sd.total == null) return tile('Saldo atual', brl.format(r.saldo_final), `Era ${brl.format(r.saldo_inicial)} em ${diaAno(r.inicio)}`);
       const it = (cod) => (sd.itens || []).find((i) => i.codigo === cod && i.secao === 'saldoCC');
-      const cc = it(998), inv = (sd.itens || []).filter((i) => i.secao !== 'saldoCC' && i.valor).reduce((t, i) => t + i.valor, 0);
-      const partes = [cc ? `Conta ${brl.format(cc.valor)}` : null, inv ? `Invest Fácil ${brl.format(inv)}` : null].filter(Boolean).join(' + ');
-      return tile('Saldo atual', brl.format(Number(sd.total)), `${partes ? partes + ' · ' : ''}consultado ${quando(sd.em)}`);
+      // 1005 = "conta corrente com Invest Fácil" (o saldo que o Bradesco mostra); 984 = saldo total com rendimento
+      const atual = it(1005) || it(984) || { valor: Number(sd.total) };
+      const rend = it(1006), lim = it(959);
+      const extra = [rend && rend.valor ? `rendimento ${brl.format(rend.valor)}` : null, lim && lim.valor ? `limite disponível ${brl.format(lim.valor)}` : null].filter(Boolean).join(' · ');
+      return tile('Saldo atual', brl.format(atual.valor), `Conta com Invest Fácil${extra ? ' · ' + extra : ''} · consultado ${quando(sd.em)}`);
     })(),
     tile(`Entradas · últimos ${DIAS[S.periodo]} dias`, brl.format(r.entradas), 'PIX, boletos, TEDs e repasses'),
     tile(`Saídas · últimos ${DIAS[S.periodo]} dias`, brl.format(r.saidas), 'Fornecedores, folha, impostos e despesas'),
