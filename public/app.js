@@ -50,8 +50,9 @@ async function api(op, body = {}) {
 const S = {
   me: null, tela: location.hash === '#configuracoes' ? 'configuracoes' : 'extrato', cfg: 'apis',
   periodo: '30d', tipo: 'todos', busca: '',
-  ext: null, cred: null, users: null,
+  ext: null, cred: null, users: null, banco: localStorage.getItem('fin_banco') === 'stone' ? 'stone' : 'bradesco',
 };
+const BANCO_TXT = { bradesco: 'Bradesco · conta corrente PJ', stone: 'Stone · conta PJ' };
 
 /* ---------- login ---------- */
 function telaLogin() {
@@ -108,7 +109,7 @@ function painelNotifs() {
   const falhou = auto && /falhou/i.test(auto.msg);
   return h('div', { class: 'np', role: 'dialog', 'aria-label': 'Notificações', onclick: (e) => e.stopPropagation() },
     h('div', { class: 'np-h' }, h('strong', {}, 'Notificações'), h('button', { type: 'button', class: 'np-x', 'aria-label': 'Fechar', onclick: () => { S.notifAberto = false; render(); } }, '×')),
-    falhou ? h('div', { class: 'np-err' }, `Última atualização automática falhou (${quando(auto.at)}): ${auto.msg.replace(/^Atualização automática falhou:\s*/, '')}`) : null,
+    falhou ? h('div', { class: 'np-err' }, `${auto.msg} (${quando(auto.at)})`) : null,
     lista.length ? h('ul', {}, lista.map((n) => h('li', { class: new Date(n.criado) > new Date(S.notif.visto_antes || 0) ? 'nova' : '' },
       h('div', { class: 'np-t' }, n.titulo, h('time', {}, quando(n.criado))),
       n.texto ? h('div', { class: 'np-s' }, n.texto) : null,
@@ -146,16 +147,16 @@ async function checaNotifs() {
   // recarrega o extrato quando chegou lançamento novo, ou a cada 15 min para trazer o saldo atualizado
   const ocupado = document.activeElement && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
   if (S.tela === 'extrato' && S.ext && !ocupado && (novas.length || Date.now() - extEm > 15 * 60e3)) {
-    try { S.ext = await api('extrato', { banco: 'bradesco' }); extEm = Date.now(); } catch (e) { /* ignora */ }
+    try { S.ext = await api('extrato', { banco: S.banco }); extEm = Date.now(); } catch (e) { /* ignora */ }
   }
   if (!ocupado || novas.length) render();
 }
 setInterval(() => { if (!document.hidden) checaNotifs(); }, 60e3);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) checaNotifs(); });
 
-async function sincronizar(btn, dias) {
+async function sincronizar(btn, dias, banco = S.banco) {
   const t = btn.textContent; btn.disabled = true; btn.textContent = 'Sincronizando…';
-  try { const r = await api('sync', { dias }); S.ext = null; S.cred = null; toast(`${r.n} lançamentos sincronizados.`); render(); }
+  try { const r = await api('sync', { dias, banco }); S.ext = null; S.cred = null; toast(`${r.n} lançamentos sincronizados.`); render(); }
   catch (e) { toast(e.message, true); btn.disabled = false; btn.textContent = t; }
 }
 
@@ -199,16 +200,17 @@ function telaExtrato() {
   const wrap = h('div', { class: 'body' });
   if (!S.ext) {
     wrap.append(h('div', { class: 'loading' }, 'Carregando extrato…'));
-    api('extrato', { banco: 'bradesco' }).then((r) => { S.ext = r; extEm = Date.now(); render(); }).catch((e) => toast(e.message, true));
+    const pedido = S.banco;
+    api('extrato', { banco: pedido }).then((r) => { if (S.banco !== pedido) return; S.ext = r; extEm = Date.now(); render(); }).catch((e) => toast(e.message, true));
     return wrap;
   }
   const rows = ordenados(S.ext.rows || []);
   wrap.append(h('header', { class: 'head' }, h('h1', {}, 'Extrato financeiro'),
-    rows.length ? frase(rows) : h('p', {}, 'Conta corrente PJ Bradesco.')));
+    rows.length ? frase(rows) : h('p', {}, S.banco === 'stone' ? 'Conta PJ Stone.' : 'Conta corrente PJ Bradesco.')));
   wrap.append(h('div', { class: 'bar' },
     h('div', { class: 'chips', role: 'group', 'aria-label': 'Conta' }, h('span', { class: 'lbl' }, 'Conta'),
-      h('button', { type: 'button', 'aria-pressed': 'true' }, 'Bradesco · conta corrente PJ'),
-      h('button', { type: 'button', disabled: true }, 'Stone ', h('small', {}, '· em breve'))),
+      Object.keys(BANCO_TXT).map((b) => h('button', { type: 'button', 'aria-pressed': String(S.banco === b),
+        onclick: () => { if (S.banco === b) return; S.banco = b; localStorage.setItem('fin_banco', b); S.ext = null; render(); } }, BANCO_TXT[b]))),
     rows.length ? h('div', { class: 'chips' },
       S.me.role === 'admin' ? h('button', { type: 'button', class: 'btn sec small', onclick: (ev) => sincronizar(ev.currentTarget, 90) }, 'Sincronizar') : null,
       h('div', { class: 'seg', role: 'group', 'aria-label': 'Período' },
@@ -219,9 +221,11 @@ function telaExtrato() {
     wrap.append(h('div', { class: 'card empty' },
       h('h2', {}, 'Ainda não há lançamentos'),
       h('p', {}, S.ext.configurado
-        ? 'As credenciais do Bradesco já estão guardadas. Clique em sincronizar para puxar o extrato do banco.'
-        : 'Para puxar o extrato, cadastre em Configurações › APIs o Client ID, o Client Secret, a agência, a conta e o certificado digital (.pfx) do Bradesco.'),
-      admin && !S.ext.configurado ? h('button', { class: 'btn', type: 'button', onclick: () => { S.cfg = 'apis'; ir('configuracoes'); } }, 'Abrir configurações de API') : null,
+        ? `As credenciais ${S.banco === 'stone' ? 'da Stone' : 'do Bradesco'} já estão guardadas. Clique em sincronizar para puxar o extrato.`
+        : S.banco === 'stone'
+          ? 'Para puxar o extrato da Stone, cadastre em Configurações › APIs o Client ID que a Stone enviou e a chave privada do par cadastrado lá (ou gere o par por aqui).'
+          : 'Para puxar o extrato, cadastre em Configurações › APIs o Client ID, o Client Secret, a agência, a conta e o certificado digital (.pfx) do Bradesco.'),
+      admin && !S.ext.configurado ? h('button', { class: 'btn', type: 'button', onclick: () => { S.cfg = 'apis'; ir('configuracoes'); setTimeout(() => $('#api-' + S.banco)?.scrollIntoView({ block: 'start' }), 300); } }, 'Abrir configurações de API') : null,
       admin && S.ext.configurado ? h('button', { class: 'btn', type: 'button', onclick: (ev) => sincronizar(ev.currentTarget, 90) }, 'Sincronizar últimos 90 dias') : null));
     return wrap;
   }
@@ -232,6 +236,11 @@ function telaExtrato() {
     (() => {
       const sd = S.ext.saldo;
       if (!sd || sd.total == null) return tile('Saldo atual', brl.format(r.saldo_final), `Era ${brl.format(r.saldo_inicial)} em ${diaAno(r.inicio)}`);
+      if (S.banco === 'stone') {
+        const v = (c) => (sd.itens || []).find((i) => i.codigo === c)?.valor || 0;
+        const extra = [v(2) ? `bloqueado ${brl.format(v(2))}` : null, v(3) ? `agendado ${brl.format(v(3))}` : null].filter(Boolean).join(' · ');
+        return tile('Saldo disponível', brl.format(Number(sd.total)), `Conta Stone${extra ? ' · ' + extra : ''} · consultado ${quando(sd.em)}`);
+      }
       const it = (cod) => (sd.itens || []).find((i) => i.codigo === cod && i.secao === 'saldoCC');
       // 1005 = "conta corrente com Invest Fácil" (o saldo que o Bradesco mostra); 984 = saldo total com rendimento
       const atual = it(1005) || it(984) || { valor: Number(sd.total) };
@@ -397,9 +406,9 @@ const BANCO_UI = {
     segredos: [['client_secret', 'Client Secret', 'password'], ['cert', 'Certificado digital A1 (.pfx)', 'file', 'O arquivo .pfx (ou .p12) do certificado usado para criar a credencial'], ['cert_senha', 'Senha do certificado', 'password']],
   },
   stone: {
-    nome: 'Stone', sub: 'API Stone Conta · extrato e saldo da conta Stone',
-    campos: [['client_id', 'Client ID', 'text', 'Fornecido pela Stone ao cadastrar a aplicação'], ['conta', 'ID da conta', 'text', '']],
-    segredos: [['api_key', 'Chave privada / API key', 'password']],
+    nome: 'Stone', sub: 'Stone Banking API · extrato e saldo da conta PJ Stone',
+    campos: [['client_id', 'Client ID', 'text', 'Enviado pela Stone por e-mail depois do cadastro da aplicação'], ['conta', 'ID da conta (opcional)', 'text', 'Deixe em branco: é preenchido sozinho no primeiro teste de conexão']],
+    segredos: [['chave_privada', 'Chave privada (.pem)', 'pem', 'Só se você já gerou o par por conta própria. Se não, use “Gerar par de chaves” abaixo.']],
   },
 };
 function painelApis() {
@@ -426,10 +435,11 @@ function cardBanco(c, admin) {
   const sec = {};
   const segredos = ui.segredos.map(([k, rot, tipo, dica]) => {
     const tem = c.segredos.includes(k);
-    sec[k] = tipo === 'file'
-      ? h('input', { type: 'file', accept: '.pfx,.p12', disabled: ro })
+    sec[k] = tipo === 'file' || tipo === 'pem'
+      ? h('input', { type: 'file', accept: tipo === 'pem' ? '.pem,.key,.txt' : '.pfx,.p12', disabled: ro, 'data-pem': tipo === 'pem' ? '1' : null })
       : h('input', { type: 'password', disabled: ro, autocomplete: 'new-password', placeholder: tem ? '•••••••• guardado' : '' });
-    const st = tipo === 'file' ? (tem ? `Guardado: ${c.cert_nome || 'certificado'}. Escolha outro arquivo só para trocar.` : dica) : (tem ? 'Guardado. Deixe em branco para manter.' : dica);
+    const st = tipo === 'pem' ? (tem ? 'Guardada no cofre. Escolha outro arquivo só para trocar.' : dica)
+      : tipo === 'file' ? (tem ? `Guardado: ${c.cert_nome || 'certificado'}. Escolha outro arquivo só para trocar.` : dica) : (tem ? 'Guardado. Deixe em branco para manter.' : dica);
     return h('label', { class: 'field' }, rot, sec[k], st ? h('span', { class: 'hint' }, st) : null);
   });
   const lerArquivo = (f) => new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(String(r.result).split(',')[1] || ''); r.onerror = () => no(new Error('Não consegui ler o arquivo.')); r.readAsDataURL(f); });
@@ -440,7 +450,8 @@ function cardBanco(c, admin) {
       const body = { banco: c.banco, ambiente: ambiente.value, segredos: {} };
       for (const k of Object.keys(ins)) body[k] = ins[k].value;
       for (const [k, el] of Object.entries(sec)) {
-        if (el.type === 'file') { const f = el.files[0]; if (f) { if (f.size > 200000) throw new Error('O certificado passa de 200 KB.'); body.segredos[k] = await lerArquivo(f); body.cert_nome = f.name; } }
+        if (el.dataset.pem) { const f = el.files[0]; if (f) { if (f.size > 20000) throw new Error('Esse arquivo não parece uma chave .pem.'); body.segredos[k] = await f.text(); } }
+        else if (el.type === 'file') { const f = el.files[0]; if (f) { if (f.size > 200000) throw new Error('O certificado passa de 200 KB.'); body.segredos[k] = await lerArquivo(f); body.cert_nome = f.name; } }
         else if (el.value) body.segredos[k] = el.value;
       }
       const r = await api('cred_save', body);
@@ -466,12 +477,39 @@ function cardBanco(c, admin) {
     h('div', { class: 'api-h' }, h('div', {}, h('h3', {}, ui.nome), h('p', {}, ui.sub)),
       h('span', { class: 'badge ' + (c.completo ? 'on' : 'off') }, c.completo ? 'Configurado' : 'Não configurado')),
     h('div', { class: 'fields' }, h('label', { class: 'field' }, 'Ambiente', ambiente), campos, segredos),
+    c.banco === 'stone' ? blocoChaveStone(c, admin) : null,
     ro ? h('p', { class: 'meta' }, 'Só administradores podem alterar as credenciais.') : null,
     h('div', { class: 'actions' }, salvar, testar,
-      c.banco === 'bradesco' && admin && c.completo ? h('button', { class: 'btn sec', type: 'button', onclick: (ev) => sincronizar(ev.currentTarget, 90) }, 'Sincronizar extrato') : null,
+      admin && c.completo ? h('button', { class: 'btn sec', type: 'button', onclick: (ev) => sincronizar(ev.currentTarget, 90, c.banco) }, 'Sincronizar extrato') : null,
       apagar),
     h('p', { class: 'meta', style: 'word-break:break-word;line-height:1.5' }, msg),
     c.atualizado ? h('p', { class: 'meta' }, `Última alteração em ${quando(c.atualizado)} por ${c.atualizado_por}.`) : null);
+}
+
+// Stone: a autenticação usa um par de chaves RSA. A privada fica só no cofre; a pública vai para a Stone.
+function blocoChaveStone(c, admin) {
+  const pub = c.chave_publica;
+  const baixar = () => { const a = h('a', { href: URL.createObjectURL(new Blob([pub], { type: 'application/x-pem-file' })), download: 'serena-stone-publica.pub' }); document.body.append(a); a.click(); a.remove(); };
+  const copiar = async (ev) => { try { await navigator.clipboard.writeText(pub); ev.currentTarget.textContent = 'Copiada'; } catch (e) { toast('Não consegui copiar; use Baixar.', true); } };
+  let armado = false;
+  const gerar = h('button', { class: 'btn ' + (pub ? 'sec' : ''), type: 'button', disabled: !admin }, pub ? 'Gerar novo par de chaves' : 'Gerar par de chaves');
+  gerar.onclick = async () => {
+    if (pub && !armado) { armado = true; gerar.textContent = 'Clique de novo: a chave atual deixa de valer'; setTimeout(() => { armado = false; gerar.textContent = 'Gerar novo par de chaves'; }, 5000); return; }
+    gerar.disabled = true; gerar.textContent = 'Gerando chave RSA 4096…';
+    try { const r = await api('stone_chave'); S.cred.bancos = r.bancos; render(); toast('Par de chaves gerado. Envie a chave pública para a Stone.'); }
+    catch (e) { toast(e.message, true); gerar.disabled = false; gerar.textContent = pub ? 'Gerar novo par de chaves' : 'Gerar par de chaves'; }
+  };
+  return h('div', { class: 'chave' },
+    h('h4', {}, 'Chave pública para cadastrar na Stone'),
+    pub
+      ? h('p', { class: 'hint' }, 'Envie este arquivo no formulário de integração da Stone. A chave privada correspondente está guardada no cofre e nunca sai do servidor.')
+      : h('p', { class: 'hint' }, 'A Stone pede um par de chaves RSA 4096. Gere aqui: a chave privada fica guardada no cofre e você só baixa a pública para enviar à Stone.'),
+    pub ? h('textarea', { readonly: true, rows: 5, spellcheck: 'false', 'aria-label': 'Chave pública' }, pub) : null,
+    h('div', { class: 'actions' },
+      pub ? h('button', { class: 'btn', type: 'button', onclick: baixar }, 'Baixar chave pública (.pub)') : null,
+      pub ? h('button', { class: 'btn sec', type: 'button', onclick: copiar }, 'Copiar') : null,
+      admin ? gerar : null),
+    pub ? h('p', { class: 'hint' }, 'Gerar um novo par invalida o atual: aí é preciso mandar a nova chave pública para a Stone.') : null);
 }
 
 function painelUsuarios() {

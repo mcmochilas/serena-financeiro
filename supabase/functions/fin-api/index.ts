@@ -19,12 +19,12 @@ const BANCOS = ["bradesco", "stone"] as const;
 // segredos aceitos por banco (nunca voltam para a tela)
 const SEGREDOS: Record<string, string[]> = {
   bradesco: ["client_secret", "cert", "cert_senha"],
-  stone: ["api_key"],
+  stone: ["chave_privada"],
 };
 // o que precisa estar preenchido para considerar o banco configurado
 const OBRIG: Record<string, { campos: string[]; segredos: string[] }> = {
   bradesco: { campos: ["client_id", "agencia", "conta"], segredos: ["client_secret", "cert"] },
-  stone: { campos: ["client_id"], segredos: ["api_key"] },
+  stone: { campos: ["client_id"], segredos: ["chave_privada"] },
 };
 
 async function quem(req: Request): Promise<Me | null> {
@@ -43,7 +43,7 @@ function resumoCred(c: any) {
   const completo = o.campos.every((k) => c[k]) && o.segredos.every((k) => tem.includes(k));
   return {
     banco: c.banco, ambiente: c.ambiente, client_id: c.client_id || "", agencia: c.agencia || "", conta: c.conta || "", cert_nome: c.cert_nome || "",
-    segredos: tem, completo, atualizado: c.atualizado, atualizado_por: c.atualizado_por,
+    chave_publica: c.chave_publica || "", segredos: tem, completo, atualizado: c.atualizado, atualizado_por: c.atualizado_por,
     teste_em: c.teste_em, teste_ok: c.teste_ok, teste_msg: c.teste_msg,
   };
 }
@@ -158,35 +158,190 @@ async function bradCred() {
   return { amb: c.ambiente as "producao" | "sandbox", id: c.client_id as string, secret: secret as string, pfx: pfx as string, senha: (senha as string) || "", agencia: c.agencia as string, conta: c.conta as string };
 }
 
+
+// ---------- Stone: Stone Banking API (docs.openbank.stone.com.br) ----------
+// Sem certificado na conexão: a autenticação é um JWT assinado (RS256) com a chave privada do par
+// cuja chave pública foi cadastrada na Stone. Tudo roda aqui mesmo, sem a ponte da Vercel.
+const STONE: Record<string, { auth: string; api: string }> = {
+  producao: { auth: "https://accounts.openbank.stone.com.br/auth/realms/stone_bank", api: "https://api.openbank.stone.com.br" },
+  sandbox: { auth: "https://sandbox-accounts.openbank.stone.com.br/auth/realms/stone_bank", api: "https://sandbox-api.openbank.stone.com.br" },
+};
+const UA = "SerenaFinanceiro/1.0";
+const bytesB64 = (u: Uint8Array) => { let s = ""; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); };
+const b64u = (x: ArrayBuffer | string) => bytesB64(typeof x === "string" ? new TextEncoder().encode(x) : new Uint8Array(x)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const pemDe = (tipo: string, der: ArrayBuffer) => `-----BEGIN ${tipo}-----\n${bytesB64(new Uint8Array(der)).match(/.{1,64}/g)!.join("\n")}\n-----END ${tipo}-----\n`;
+const derLen = (n: number) => { if (n < 128) return [n]; const b: number[] = []; while (n) { b.unshift(n & 255); n >>= 8; } return [0x80 | b.length, ...b]; };
+const der = (tag: number, body: number[]) => [tag, ...derLen(body.length), ...body];
+const RSA = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
+// Aceita a chave privada em PKCS#8 ("BEGIN PRIVATE KEY") ou PKCS#1 ("BEGIN RSA PRIVATE KEY", a do openssl antigo).
+// Devolve a chave normalizada em PKCS#8 e a chave pública correspondente (para conferir com a cadastrada na Stone).
+async function lerChave(texto: string) {
+  const t = String(texto || "");
+  if (/ENCRYPTED/.test(t)) throw new Erro("Essa chave privada está protegida por senha. Gere a chave sem senha (openssl genrsa -out chave.pem 4096).", 400);
+  const m = t.match(/-----BEGIN (RSA )?PRIVATE KEY-----([\s\S]+?)-----END (RSA )?PRIVATE KEY-----/);
+  if (!m) throw new Erro("Arquivo de chave privada inválido: esperado um .pem com BEGIN PRIVATE KEY (a chave pública .pub não serve aqui).", 400);
+  let bin: Uint8Array;
+  try { bin = Uint8Array.from(atob(m[2].replace(/\s+/g, "")), (c) => c.charCodeAt(0)); } catch { throw new Erro("Chave privada corrompida.", 400); }
+  if (m[1]) bin = new Uint8Array(der(0x30, [0x02, 0x01, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00, ...der(0x04, [...bin])]));
+  let k: CryptoKey;
+  try { k = await crypto.subtle.importKey("pkcs8", bin, RSA, true, ["sign"]); } catch { throw new Erro("Não consegui ler a chave privada (precisa ser RSA).", 400); }
+  const jwk = await crypto.subtle.exportKey("jwk", k);
+  const bits = Math.round((jwk.n!.length * 6) / 8) * 8;
+  if (bits < 2000) throw new Erro("A chave é curta demais; a Stone pede RSA 4096.", 400);
+  const pub = await crypto.subtle.importKey("jwk", { kty: "RSA", n: jwk.n, e: jwk.e, alg: "RS256", ext: true }, RSA, true, ["verify"]);
+  return { privada: pemDe("PRIVATE KEY", await crypto.subtle.exportKey("pkcs8", k)), publica: pemDe("PUBLIC KEY", await crypto.subtle.exportKey("spki", pub)), bits };
+}
+async function gerarChave() {
+  const kp = await crypto.subtle.generateKey({ ...RSA, modulusLength: 4096, publicExponent: new Uint8Array([1, 0, 1]) }, true, ["sign", "verify"]) as CryptoKeyPair;
+  return { privada: pemDe("PRIVATE KEY", await crypto.subtle.exportKey("pkcs8", kp.privateKey)), publica: pemDe("PUBLIC KEY", await crypto.subtle.exportKey("spki", kp.publicKey)) };
+}
+async function stoneCred() {
+  const c = await q(db.from("fin_credenciais").select("*").eq("banco", "stone").single());
+  const chave = await q(db.rpc("fin_secret_get", { p_banco: "stone", p_nome: "chave_privada" }));
+  must(c.client_id && chave, "Preencha o Client ID e a chave privada da Stone antes.", 400);
+  return { amb: (c.ambiente === "sandbox" ? "sandbox" : "producao") as string, id: c.client_id as string, chave: chave as string, conta: (c.conta as string) || "" };
+}
+async function stoneToken(cr: Awaited<ReturnType<typeof stoneCred>>) {
+  const base = STONE[cr.amb], agora = Math.floor(Date.now() / 1000);
+  const cab = b64u(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const corpo = b64u(JSON.stringify({ exp: agora + 600, nbf: agora - 30, aud: base.auth, realm: "stone_bank", sub: cr.id, clientId: cr.id, jti: crypto.randomUUID(), iat: agora - 30, iss: cr.id }));
+  const pk = (await lerChave(cr.chave)).privada.replace(/-----[^-]+-----|\s/g, "");
+  const k = await crypto.subtle.importKey("pkcs8", Uint8Array.from(atob(pk), (c) => c.charCodeAt(0)), RSA, false, ["sign"]);
+  const sig = await crypto.subtle.sign(RSA.name, k, new TextEncoder().encode(`${cab}.${corpo}`));
+  let r: Response;
+  try {
+    r = await fetch(`${base.auth}/protocol/openid-connect/token`, {
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": UA }, signal: AbortSignal.timeout(20000),
+      body: new URLSearchParams({ client_id: cr.id, grant_type: "client_credentials", client_assertion: `${cab}.${corpo}.${b64u(sig)}`, client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" }),
+    });
+  } catch (e) { throw new Erro("Sem resposta da Stone (token): " + curto(String((e as Error)?.message || e)), 502); }
+  const t = await r.text(); let j: any = null; try { j = JSON.parse(t); } catch { /* texto */ }
+  if (!r.ok || !j?.access_token) {
+    const det = curto(j?.error_description || j?.error || t);
+    const dica = /invalid_client|unauthorized_client|signature|not found/i.test(det) ? " Confira se o Client ID é o que a Stone enviou e se a chave pública cadastrada lá é o par desta chave privada." : "";
+    throw new Erro(`A Stone não liberou o acesso (token): HTTP ${r.status} ${det}.${dica}`, 502);
+  }
+  return j.access_token as string;
+}
+async function stoneGet(cr: { amb: string }, tok: string, path: string) {
+  let r: Response;
+  try { r = await fetch(STONE[cr.amb].api + path, { headers: { Authorization: `Bearer ${tok}`, "User-Agent": UA, Accept: "application/json" }, signal: AbortSignal.timeout(25000) }); }
+  catch (e) { throw new Erro("Sem resposta da Stone: " + curto(String((e as Error)?.message || e)), 502); }
+  const t = await r.text(); let j: any = null; try { j = JSON.parse(t); } catch { /* texto */ }
+  if (!r.ok) throw new Erro(`Acesso liberado, mas a Stone respondeu HTTP ${r.status} em ${path.split("?")[0].replace(/[0-9a-f]{8}-[0-9a-f-]{27}/gi, "{conta}")}: ${curto(j?.message || j?.error || j?.type || t)}`, 502);
+  return j;
+}
+// Conta: usa a informada; se estiver em branco, descobre pela lista de contas liberadas para a aplicação e guarda.
+async function stoneConta(cr: Awaited<ReturnType<typeof stoneCred>>, tok: string) {
+  let lista: any[] = [];
+  try { lista = (await stoneGet(cr, tok, "/api/v1/accounts?paginate=false"))?.data || []; } catch (e) { if (!cr.conta) throw e; }
+  let conta = cr.conta ? lista.find((a) => a.id === cr.conta) : lista[0];
+  if (cr.conta && !conta && lista.length) throw new Erro(`O ID da conta informado não está entre as contas liberadas para esta aplicação (${lista.map((a) => `${a.account_code} → ${a.id}`).join("; ")}).`, 400);
+  if (!cr.conta) {
+    must(conta, "A Stone não devolveu nenhuma conta para esta aplicação.", 502);
+    await q(db.from("fin_credenciais").update({ conta: conta.id }).eq("banco", "stone"));
+  }
+  return { id: (conta?.id || cr.conta) as string, info: conta ? `conta ${conta.account_code}${conta.owner_name ? ` de ${String(conta.owner_name).trim()}` : ""}` : "conta informada", outras: Math.max(0, lista.length - 1) };
+}
+const isoZ = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
+async function stoneExtrato(cr: { amb: string }, tok: string, conta: string, desdeISO: string) {
+  const out: any[] = []; let after = "";
+  for (let p = 0; p < 300; p++) {
+    const qs = new URLSearchParams({ limit: "100", start_datetime: `${desdeISO}T03:00:00Z`, end_datetime: isoZ(new Date(Date.now() + 60e3)) });
+    if (after) qs.set("after", after);
+    const j = await stoneGet(cr, tok, `/api/v1/accounts/${conta}/statement?${qs}`);
+    const d = Array.isArray(j?.data) ? j.data : [];
+    out.push(...d);
+    const prox = j?.cursor?.after;
+    if (!d.length || !prox || prox === after) break;
+    after = prox;
+  }
+  return out;
+}
+const STONE_TIPO: Record<string, [string, string]> = {
+  instant_payment: ["PIX RECEBIDO", "PIX ENVIADO"], pix_payment: ["PIX RECEBIDO", "PIX ENVIADO"],
+  instant_payment_refund: ["PIX DEVOLVIDO A VOCE", "PIX DEVOLVIDO"], external: ["TED RECEBIDA", "TED ENVIADA"],
+  external_refund: ["TED DEVOLVIDA", "TED DEVOLVIDA"], internal: ["TRANSFERENCIA STONE RECEBIDA", "TRANSFERENCIA STONE ENVIADA"],
+  payment: ["BOLETO ESTORNADO", "PAGTO BOLETO"], payment_refund: ["BOLETO ESTORNADO", "BOLETO ESTORNADO"],
+  card_payment: ["CARTAO ESTORNO", "COMPRA CARTAO"], balance_block: ["DESBLOQUEIO DE SALDO", "BLOQUEIO DE SALDO"],
+  salary: ["SALARIO", "SALARIO"], salary_portability: ["PORTABILIDADE SALARIO", "PORTABILIDADE SALARIO"],
+};
+function stoneRows(ents: any[], conta: string) {
+  const vistos = new Map<string, number>();
+  const rows = ents
+    .filter((e) => e && e.created_at && !/fail|cancel|reject|refused|denied/i.test(String(e.status || "")))
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
+    .map((e) => {
+      const deb = e.operation === "debit";
+      const antes = Number(e.balance_before), depois = Number(e.balance_after);
+      const cent = Number.isFinite(antes) && Number.isFinite(depois) && antes !== depois ? depois - antes : (deb ? -1 : 1) * (Number(e.amount) || 0) - (deb ? Number(e.fee_amount) || 0 : 0);
+      const v = Math.round(cent) / 100;
+      const rot = STONE_TIPO[e.type]?.[deb ? 1 : 0] || String(e.type || "movimentacao").replace(/_/g, " ").toUpperCase();
+      const nome = String(e.counter_party?.entity?.name || e.details?.recipient_name || "").trim();
+      const desc = [rot, nome ? (deb ? "DES: " : "REM: ") + nome : "", String(e.description || "").trim()].filter(Boolean).join(" · ");
+      const data = new Date(new Date(e.created_at).getTime() - 3 * 3600e3).toISOString().slice(0, 10);
+      const base = `stn-${e.id}-${e.type}-${e.operation}`;
+      const n = (vistos.get(base) || 0) + 1; vistos.set(base, n);
+      return { id: n > 1 ? `${base}-${n}` : base, banco: "stone", conta, data, descricao: desc, categoria: categoria(desc, v), tipo: v > 0 ? "Entrada" : "Saída",
+        valor: v, saldo: Number.isFinite(depois) ? depois / 100 : null, documento: null, raw: e };
+    })
+    .filter((r) => r.valor);
+  const porDia = new Map<string, number>();
+  for (const r of rows) { const n = (porDia.get(r.data) || 0) + 1; porDia.set(r.data, n); (r as any).ordem = n; }
+  return rows;
+}
+function stoneSaldo(j: any) {
+  const v = (x: unknown) => (Number(x) || 0) / 100;
+  const itens = [
+    { secao: "stone", nome: "Saldo disponível", codigo: 1, valor: v(j?.balance) },
+    { secao: "stone", nome: "Saldo bloqueado", codigo: 2, valor: v(j?.blocked_balance) },
+    { secao: "stone", nome: "Agendado", codigo: 3, valor: v(j?.scheduled_balance) },
+  ];
+  return { itens, total: itens[0].valor, raw: j };
+}
+
 // "agora" no fuso de Brasília (o banco trabalha com datas locais; depois das 21h o UTC já é o dia seguinte)
 const agoraBR = () => new Date(Date.now() - 3 * 3600e3);
 const brl = (v: number) => (v < 0 ? "-" : "+") + "R$ " + Math.abs(v).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 // Grava o saldo: se não mudou desde a última consulta, só atualiza o horário (não acumula linhas iguais)
-async function gravaSaldo(conta: string, json: any) {
-  const sd = saldoItens(json);
-  const ult = (await q(db.from("fin_saldos").select("id,total,itens").eq("banco", "bradesco").order("em", { ascending: false }).limit(1)))[0];
+type Saldo = { itens: { secao: string; nome: string; codigo: number; valor: number }[]; total: number | null; raw: unknown };
+async function gravaSaldo(banco: string, conta: string, sd: Saldo) {
+  const ult = (await q(db.from("fin_saldos").select("id,total,itens").eq("banco", banco).order("em", { ascending: false }).limit(1)))[0];
   if (ult && Number(ult.total) === Number(sd.total) && JSON.stringify(ult.itens) === JSON.stringify(sd.itens))
     await q(db.from("fin_saldos").update({ em: new Date().toISOString() }).eq("id", ult.id));
-  else await q(db.from("fin_saldos").insert({ banco: "bradesco", conta, total: sd.total, itens: sd.itens, raw: json }));
+  else await q(db.from("fin_saldos").insert({ banco, conta, total: sd.total, itens: sd.itens, raw: sd.raw }));
   return sd;
 }
+const NOME: Record<string, string> = { bradesco: "Bradesco", stone: "Stone" };
+const NO: Record<string, string> = { bradesco: "no Bradesco", stone: "na Stone" };
+// Busca extrato + saldo de um banco, de `dias` atrás até agora (datas de Brasília)
+async function buscaBanco(banco: string, dias: number): Promise<{ conta: string; rows: any[]; saldo: Saldo | null; saldo_erro?: string | null; info?: string }> {
+  const fim = agoraBR(), ini = new Date(fim.getTime() - dias * 864e5);
+  if (banco === "bradesco") {
+    const cr = await bradCred();
+    const x = await bradesco(cr, ini, fim, { saldo: true });
+    if (!x.ok) throw new Erro(explica(x), 502);
+    return { conta: cr.conta, rows: lancamentos(x.json, cr.conta), saldo: x.saldo?.json ? { ...saldoItens(x.saldo.json), raw: x.saldo.json } : null,
+      saldo_erro: x.saldo && !x.saldo.json ? `HTTP ${x.saldo.status}: ${x.saldo.texto}` : null };
+  }
+  must(banco === "stone", "Banco inválido.", 400);
+  const cr = await stoneCred();
+  const tok = await stoneToken(cr);
+  const ct = await stoneConta(cr, tok);
+  const [ents, bal] = await Promise.all([stoneExtrato(cr, tok, ct.id, ini.toISOString().slice(0, 10)), stoneGet(cr, tok, `/api/v1/accounts/${ct.id}/balance`)]);
+  return { conta: ct.id, rows: stoneRows(ents, ct.id), saldo: stoneSaldo(bal), info: ct.info + (ct.outras ? ` (há mais ${ct.outras} conta(s) liberada(s); para usar outra, informe o ID dela)` : "") };
+}
 
-// Rotina automática (a cada 15 min, pelo pg_cron): saldo + lançamentos dos últimos dias.
-// Grava tudo (nada é apagado) e, se aparecer lançamento que ainda não estava no banco, cria uma notificação.
-async function rotina() {
-  const c = (await credenciais()).find((x) => x.banco === "bradesco");
-  if (!c?.completo) return { ok: false, motivo: "Bradesco não configurado" };
-  const cr = await bradCred();
-  const fim = agoraBR();
-  const x = await bradesco(cr, new Date(fim.getTime() - 2 * 864e5), fim, { saldo: true });
-  if (!x.ok) { await log("auto", `Atualização automática falhou: ${explica(x)}`); return { ok: false, motivo: explica(x) }; }
-  const rows = lancamentos(x.json, cr.conta);
-  const sd = x.saldo?.json ? await gravaSaldo(cr.conta, x.saldo.json) : null;
+// Um banco na rotina automática: busca, grava (upsert, nunca apaga) e avisa o que ainda não estava gravado
+async function rotinaBanco(banco: string) {
+  const x = await buscaBanco(banco, 2);
+  const rows = x.rows;
+  const sd = x.saldo ? await gravaSaldo(banco, x.conta, x.saldo) : null;
 
   // o que já estava gravado nesses dias
   const dias = [...new Set(rows.map((r) => r.data))];
-  const ja = dias.length ? await q(db.from("fin_lancamentos").select("id,data,valor").eq("banco", "bradesco").in("data", dias)) : [];
+  const ja = dias.length ? await q(db.from("fin_lancamentos").select("id,data,valor").eq("banco", banco).in("data", dias)) : [];
   const ids = new Set(ja.map((r: any) => r.id));
   // conferência extra por dia+valor: evita avisar de novo um lançamento que o banco reapresentou com outro número
   const qtd = new Map<string, number>();
@@ -208,15 +363,31 @@ async function rotina() {
   if (novos.length) {
     const ent = novos.filter((r) => r.valor > 0).reduce((s, r) => s + r.valor, 0);
     const sai = novos.filter((r) => r.valor < 0).reduce((s, r) => s + r.valor, 0);
-    const titulo = novos.length === 1 ? "1 novo lançamento no Bradesco" : `${novos.length} novos lançamentos no Bradesco`;
-    const partes = [ent ? `Entradas ${brl(ent)}` : "", sai ? `Saídas ${brl(sai)}` : "", sd?.itens ? `Saldo ${brl((sd.itens.find((i) => i.codigo === 1005) || { valor: sd.total || 0 }).valor).replace("+", "")}` : ""].filter(Boolean);
+    const titulo = novos.length === 1 ? `1 novo lançamento ${NO[banco]}` : `${novos.length} novos lançamentos ${NO[banco]}`;
+    const atual = sd ? (banco === "bradesco" ? (sd.itens.find((i) => i.codigo === 1005)?.valor ?? sd.total) : sd.total) : null;
+    const partes = [ent ? `Entradas ${brl(ent)}` : "", sai ? `Saídas ${brl(sai)}` : "", atual != null ? `Saldo ${brl(atual).replace("+", "")}` : ""].filter(Boolean);
     await q(db.from("fin_notificacoes").insert({
-      banco: "bradesco", titulo, texto: partes.join(" · "),
+      banco, titulo, texto: partes.join(" · "),
       dados: { itens: novos.slice(0, 50).map((r) => ({ id: r.id, data: r.data, valor: r.valor, descricao: r.descricao })) },
     }));
-    await log("auto", `${titulo}`);
+    await log("auto", titulo);
   }
-  return { ok: true, lidos: rows.length, novos: novos.length, saldo: sd?.total ?? null };
+  return { lidos: rows.length, novos: novos.length, saldo: sd?.total ?? null };
+}
+// Rotina automática (a cada 15 min, pelo pg_cron): para cada banco configurado, saldo + lançamentos dos últimos dias.
+// Grava tudo (nada é apagado) e, se aparecer lançamento que ainda não estava no banco, cria uma notificação.
+async function rotina() {
+  const res: Record<string, unknown> = {};
+  for (const c of await credenciais()) {
+    if (!c.completo) { res[c.banco] = "não configurado"; continue; }
+    try { res[c.banco] = await rotinaBanco(c.banco); }
+    catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      await log("auto", `Atualização automática (${NOME[c.banco]}) falhou: ${m}`);
+      res[c.banco] = { erro: m };
+    }
+  }
+  return { ok: true, ...res };
 }
 
 Deno.serve(async (req) => {
@@ -297,6 +468,13 @@ Deno.serve(async (req) => {
           const v = String(valor ?? "");
           if (!v) continue; // vazio = manter o que já está guardado
           must(v.length <= 300000, "Arquivo ou chave grande demais.", 400);
+          if (nome === "chave_privada") {
+            const k = await lerChave(v);
+            await q(db.rpc("fin_secret_put", { p_banco: banco, p_nome: nome, p_valor: k.privada }));
+            upd.chave_publica = k.publica;
+            mudou.push(nome);
+            continue;
+          }
           if (nome === "cert") {
             must(/^[A-Za-z0-9+/=\s]+$/.test(v), "Certificado inválido.", 400);
             upd.cert_nome = txt(b.cert_nome, 120) || "certificado";
@@ -318,7 +496,7 @@ Deno.serve(async (req) => {
         if (!c.completo) {
           const o = OBRIG[banco];
           const falta = [...o.campos.filter((k) => !(c as any)[k]), ...o.segredos.filter((k) => !c.segredos.includes(k))];
-          ok = false; msg = "Falta preencher: " + falta.map((k) => ({ client_id: "Client ID", agencia: "agência", conta: "conta", client_secret: "Client Secret", cert: "certificado (.pfx)", api_key: "chave privada" } as any)[k] || k).join(", ") + ".";
+          ok = false; msg = "Falta preencher: " + falta.map((k) => ({ client_id: "Client ID", agencia: "agência", conta: "conta", client_secret: "Client Secret", cert: "certificado (.pfx)", chave_privada: "chave privada (.pem)" } as any)[k] || k).join(", ") + ".";
         } else if (banco === "bradesco") {
           const cr = await bradCred();
           const x = await bradesco(cr, new Date(Date.now() - 6 * 864e5), new Date());
@@ -328,7 +506,10 @@ Deno.serve(async (req) => {
             ok = true; msg = `Conexão OK. Extrato dos últimos 7 dias: ${n} lançamentos.${ret.mensagem ? " Banco: " + String(ret.mensagem).trim() : ""}`;
           } else { ok = false; msg = explica(x); }
         } else {
-          ok = null; msg = "Credenciais guardadas. A conexão com a Stone entra numa próxima etapa.";
+          try {
+            const x = await buscaBanco("stone", 6);
+            ok = true; msg = `Conexão OK: ${x.info}. Saldo disponível ${brl(x.saldo?.total || 0).replace("+", "")}. Extrato dos últimos 7 dias: ${x.rows.length} lançamentos.`;
+          } catch (e) { ok = false; msg = e instanceof Error ? e.message : String(e); }
         }
         await log(me.login, `Teste ${banco}: ${msg}`);
         await q(db.from("fin_credenciais").update({ teste_em: new Date().toISOString(), teste_ok: ok, teste_msg: msg }).eq("banco", banco));
@@ -341,25 +522,31 @@ Deno.serve(async (req) => {
         must(BANCOS.includes(banco as any), "Banco inválido.", 400);
         const c = await q(db.from("fin_credenciais").select("secrets").eq("banco", banco).single());
         for (const nome of Object.keys(c.secrets || {})) await q(db.rpc("fin_secret_put", { p_banco: banco, p_nome: nome, p_valor: "" }));
-        await q(db.from("fin_credenciais").update({ client_id: null, agencia: null, conta: null, cert_nome: null, secrets: {}, atualizado: new Date().toISOString(), atualizado_por: me.login, teste_em: null, teste_ok: null, teste_msg: null }).eq("banco", banco));
+        await q(db.from("fin_credenciais").update({ client_id: null, agencia: null, conta: null, cert_nome: null, chave_publica: null, secrets: {}, atualizado: new Date().toISOString(), atualizado_por: me.login, teste_em: null, teste_ok: null, teste_msg: null }).eq("banco", banco));
         await log(me.login, `${me.nome} apagou as credenciais ${banco}`);
         return out({ bancos: await credenciais() });
       }
 
 
+      case "stone_chave": {
+        must(admin, "Só administradores alteram as credenciais.");
+        const k = await gerarChave();
+        await q(db.rpc("fin_secret_put", { p_banco: "stone", p_nome: "chave_privada", p_valor: k.privada }));
+        await q(db.from("fin_credenciais").update({ chave_publica: k.publica, atualizado: new Date().toISOString(), atualizado_por: me.login, teste_em: null, teste_ok: null, teste_msg: null }).eq("banco", "stone"));
+        await log(me.login, `${me.nome} gerou um novo par de chaves da Stone`);
+        return out({ bancos: await credenciais() });
+      }
+
       case "sync": {
         must(admin, "Só administradores sincronizam o extrato.");
+        const banco = BANCOS.includes(b.banco) ? b.banco : "bradesco";
         const dias = Math.min(365, Math.max(1, Number(b.dias) || 90));
-        const cr = await bradCred();
-        const fim = agoraBR();
-        const x = await bradesco(cr, new Date(fim.getTime() - (dias - 1) * 864e5), fim, { saldo: true });
-        if (!x.ok) throw new Erro(explica(x), 502);
-        const rows = lancamentos(x.json, cr.conta);
-        if (x.saldo?.json) await gravaSaldo(cr.conta, x.saldo.json);
-        for (let i = 0; i < rows.length; i += 500) await q(db.from("fin_lancamentos").upsert(rows.slice(i, i + 500)));
-        await q(db.from("fin_credenciais").update({ teste_em: new Date().toISOString(), teste_ok: true, teste_msg: `Sincronizado: ${rows.length} lançamentos dos últimos ${dias} dias.` }).eq("banco", "bradesco"));
-        await log(me.login, `${me.nome} sincronizou o extrato Bradesco: ${rows.length} lançamentos (${dias} dias)`);
-        return out({ ok: true, n: rows.length, dias, saldo: x.saldo?.json ? saldoItens(x.saldo.json).total : null, saldo_erro: x.saldo && !x.saldo.json ? `HTTP ${x.saldo.status}: ${x.saldo.texto}` : null });
+        const x = await buscaBanco(banco, dias - 1);
+        if (x.saldo) await gravaSaldo(banco, x.conta, x.saldo);
+        for (let i = 0; i < x.rows.length; i += 500) await q(db.from("fin_lancamentos").upsert(x.rows.slice(i, i + 500)));
+        await q(db.from("fin_credenciais").update({ teste_em: new Date().toISOString(), teste_ok: true, teste_msg: `Sincronizado: ${x.rows.length} lançamentos dos últimos ${dias} dias.` }).eq("banco", banco));
+        await log(me.login, `${me.nome} sincronizou o extrato ${NOME[banco]}: ${x.rows.length} lançamentos (${dias} dias)`);
+        return out({ ok: true, n: x.rows.length, dias, saldo: x.saldo?.total ?? null, saldo_erro: x.saldo_erro || null });
       }
 
       case "notifs": {

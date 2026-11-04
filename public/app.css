@@ -156,3 +156,9 @@ table.tb { width: 100%; border-collapse: collapse; font-size: var(--cap); font-v
 .np-vazio { padding: 16px 14px; margin: 0; font-size: 13px; color: #5C564C; }
 .np-err { margin: 10px 14px 0; padding: 8px 10px; border-radius: 8px; background: #FCEBEA; color: #8E2B22; font-size: 12px; }
 .np-f { padding: 10px 14px; font-size: 11px; color: #7A7366; background: #FAF7F2; }
+
+/* Stone: chave pública */
+.chave { margin-top: 14px; padding: 14px; border: 1px dashed #D9CFBF; border-radius: 10px; background: #FBF8F3; }
+.chave h4 { margin: 0 0 4px; font-family: var(--display); color: var(--petrol-d); font-size: 14px; }
+.chave textarea { width: 100%; box-sizing: border-box; margin: 8px 0; font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: #3A3A3A; background: #fff; border: 1px solid #E5DCCD; border-radius: 8px; padding: 8px; resize: vertical; }
+.chave .actions { margin-top: 6px; }
