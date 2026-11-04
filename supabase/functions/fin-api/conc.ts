@@ -10,7 +10,7 @@ export type Candidato = Lanc & {
 // Recebimentos que não vêm de cliente (resgate de aplicação, rendimento, transferência entre contas da própria empresa)
 const NAO_CLIENTE = /SERENA PUX|RESGATE|RENTAB|INVEST FACIL|APLIC/i;
 export const ehRecebimentoDeCliente = (l: { valor: number; descricao: string; categoria?: string | null }) =>
-  l.valor > 0 && l.categoria !== "Investimentos" && !NAO_CLIENTE.test(l.descricao || "");
+  l.valor > 0 && l.categoria !== "Investimentos" && l.categoria !== "Cartão cancelado" && !NAO_CLIENTE.test(l.descricao || "");
 
 // Nome de quem pagou, tirado da descrição do extrato ("PIX RECEBIDO · REM: RAQUEL DE ARAUJO      04/11")
 export function pagador(desc: string) {

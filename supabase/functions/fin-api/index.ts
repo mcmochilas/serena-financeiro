@@ -2,6 +2,7 @@
 // Publicada sem verificação de JWT: a autenticação é feita aqui, por token de sessão (x-fin-token).
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { candidatos, ehRecebimentoDeCliente, pagador, JANELA, type Pedido } from "./conc.ts";
+import { baixarArquivo, lerArquivo } from "./stone_vendas.ts";
 
 const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
 const CORS = {
@@ -16,16 +17,18 @@ const q = async <T>(p: PromiseLike<{ data: T; error: { message: string } | null 
 const txt = (v: unknown, max = 200) => String(v ?? "").trim().slice(0, max);
 
 type Me = { login: string; nome: string; role: string };
-const BANCOS = ["bradesco", "stone"] as const;
+const BANCOS = ["bradesco", "stone", "stone_vendas"] as const;
 // segredos aceitos por banco (nunca voltam para a tela)
 const SEGREDOS: Record<string, string[]> = {
   bradesco: ["client_secret", "cert", "cert_senha"],
   stone: ["chave_privada"],
+  stone_vendas: ["chave"],
 };
 // o que precisa estar preenchido para considerar o banco configurado
 const OBRIG: Record<string, { campos: string[]; segredos: string[] }> = {
   bradesco: { campos: ["client_id", "agencia", "conta"], segredos: ["client_secret", "cert"] },
   stone: { campos: ["client_id"], segredos: ["chave_privada"] },
+  stone_vendas: { campos: ["conta"], segredos: ["chave"] },
 };
 
 async function quem(req: Request): Promise<Me | null> {
@@ -314,8 +317,8 @@ async function gravaSaldo(banco: string, conta: string, sd: Saldo) {
   else await q(db.from("fin_saldos").insert({ banco, conta, total: sd.total, itens: sd.itens, raw: sd.raw }));
   return sd;
 }
-const NOME: Record<string, string> = { bradesco: "Bradesco", stone: "Stone" };
-const NO: Record<string, string> = { bradesco: "no Bradesco", stone: "na Stone" };
+const NOME: Record<string, string> = { bradesco: "Bradesco", stone: "Stone", stone_vendas: "Stone (cartão)" };
+const NO: Record<string, string> = { bradesco: "no Bradesco", stone: "na Stone", stone_vendas: "no cartão (Stone)" };
 // Busca extrato + saldo de um banco, de `dias` atrás até agora (datas de Brasília)
 async function buscaBanco(banco: string, dias: number): Promise<{ conta: string; rows: any[]; saldo: Saldo | null; saldo_erro?: string | null; info?: string }> {
   const fim = agoraBR(), ini = new Date(fim.getTime() - dias * 864e5);
@@ -332,6 +335,102 @@ async function buscaBanco(banco: string, dias: number): Promise<{ conta: string;
   const ct = await stoneConta(cr, tok);
   const [ents, bal] = await Promise.all([stoneExtrato(cr, tok, ct.id, ini.toISOString().slice(0, 10)), stoneGet(cr, tok, `/api/v1/accounts/${ct.id}/balance`)]);
   return { conta: ct.id, rows: stoneRows(ents, ct.id), saldo: stoneSaldo(bal), info: ct.info + (ct.outras ? ` (há mais ${ct.outras} conta(s) liberada(s); para usar outra, informe o ID dela)` : "") };
+}
+
+
+// ---------- Stone: vendas no cartão (API de Conciliação, arquivo diário) ----------
+async function stoneVendasCred() {
+  const c = await q(db.from("fin_credenciais").select("conta").eq("banco", "stone_vendas").single());
+  const chave = await q(db.rpc("fin_secret_get", { p_banco: "stone_vendas", p_nome: "chave" }));
+  must(c.conta && chave, "Preencha o StoneCode e a chave da API de Conciliação da Stone antes.", 400);
+  return { codes: String(c.conta).split(",").map((x) => x.trim()).filter(Boolean), chave: chave as string };
+}
+// O arquivo do dia D fica pronto depois das 5h de D+1 (horário de Brasília); usamos 6h por folga
+function ultimoDiaPronto() {
+  const a = agoraBR(), hoje = a.toISOString().slice(0, 10);
+  return somaDias(hoje, a.getUTCHours() >= 6 ? -1 : -2);
+}
+// Baixa e grava um dia de um StoneCode. Vendas entram em fin_lancamentos (banco stone_vendas); cancelamentos
+// de vendas de outros dias atualizam a venda original (uma vez por arquivo). Nada é apagado.
+async function processaDiaStone(sc: string, chave: string, dia: string) {
+  const a = await baixarArquivo(sc, chave, dia);
+  if (!a.ok) {
+    await q(db.from("fin_stone_arquivos").upsert({ stonecode: sc, data: dia, ok: false, erro: a.erro, baixado_em: new Date().toISOString() }));
+    return { ok: false as const, status: a.status, erro: a.erro || "Falha ao baixar o arquivo." };
+  }
+  let r: ReturnType<typeof lerArquivo>;
+  try { r = lerArquivo(a.xml!, sc); }
+  catch (e) {
+    const erro = (e as Error).message;
+    await q(db.from("fin_stone_arquivos").upsert({ stonecode: sc, data: dia, ok: false, erro, baixado_em: new Date().toISOString() }));
+    return { ok: false as const, status: 200, erro };
+  }
+  const vendas = [...r.vendas].sort((x, y) => (x.data + x.hora).localeCompare(y.data + y.hora));
+  const ids = vendas.map((v) => v.id);
+  const ja = ids.length ? await emLotes(ids, (l) => q(db.from("fin_lancamentos").select("id,valor,categoria,descricao,raw").in("id", l))) : [];
+  const exist = new Map(ja.map((x: any) => [x.id, x]));
+  const porDia = new Map<string, number>();
+  const rows = vendas.map(({ hora: _h, ...v }) => {
+    const o = (porDia.get(v.data) || 0) + 1; porDia.set(v.data, o);
+    const e: any = exist.get(v.id);
+    // venda já cancelada (parcial ou total) por arquivo de outro dia: mantém o valor atualizado
+    if (e?.raw?.canc_aplicados?.length) return { ...v, ordem: o, valor: Number(e.valor), categoria: e.categoria, descricao: e.descricao, raw: { ...v.raw, canc_aplicados: e.raw.canc_aplicados } };
+    return { ...v, ordem: o };
+  });
+  for (let i = 0; i < rows.length; i += 500) await q(db.from("fin_lancamentos").upsert(rows.slice(i, i + 500)));
+  for (const c of r.cancelamentos) {
+    const v: any = (await q(db.from("fin_lancamentos").select("id,valor,categoria,descricao,raw").eq("id", c.id).maybeSingle()));
+    if (!v) continue;
+    const aplicados: string[] = v.raw?.canc_aplicados || [];
+    if (aplicados.includes(dia)) continue;
+    const novo = r2(Number(v.valor) - c.valor);
+    const cancelada = novo <= 0.005;
+    await q(db.from("fin_lancamentos").update({
+      valor: cancelada ? Number(v.valor) : novo, categoria: cancelada ? "Cartão cancelado" : v.categoria,
+      descricao: `${v.descricao} · ${cancelada ? "CANCELADA" : "cancelado R$ " + c.valor.toFixed(2).replace(".", ",")} em ${dia.split("-").reverse().slice(0, 2).join("/")}`,
+      raw: { ...(v.raw || {}), canc_aplicados: [...aplicados, dia] },
+    }).eq("id", c.id));
+  }
+  await q(db.from("fin_stone_arquivos").upsert({ stonecode: sc, data: dia, ok: true, vendas: r.qtd, total: r.total, erro: null, baixado_em: new Date().toISOString() }));
+  const novas = rows.filter((x) => !exist.has(x.id) && x.categoria === "Vendas no cartão");
+  return { ok: true as const, qtd: r.qtd, total: r.total, novas };
+}
+// Baixa os dias que faltam (do mais recente para o mais antigo), no máximo `limite` arquivos por chamada
+async function sincStoneVendas(dias: number, limite: number, auto = false) {
+  const cr = await stoneVendasCred();
+  const fim = ultimoDiaPronto(), ini = somaDias(fim, -(dias - 1));
+  const feitos = await q(db.from("fin_stone_arquivos").select("stonecode,data,ok,baixado_em").in("stonecode", cr.codes).gte("data", ini).lte("data", fim));
+  const est = new Map(feitos.map((f: any) => [`${f.stonecode}|${f.data}`, f]));
+  const fila: [string, string][] = [];
+  for (let d = fim; d >= ini; d = somaDias(d, -1)) for (const sc of cr.codes) {
+    const f: any = est.get(`${sc}|${d}`);
+    if (f?.ok) continue;
+    // na rotina automática, um dia que deu erro só é tentado de novo depois de 3 horas
+    if (auto && f && Date.now() - new Date(f.baixado_em).getTime() < 3 * 3600e3) continue;
+    fila.push([sc, d]);
+  }
+  let processados = 0, erro: string | null = null, vendas = 0, total = 0;
+  const novas: any[] = [];
+  for (const [sc, d] of fila.slice(0, limite)) {
+    const x = await processaDiaStone(sc, cr.chave, d);
+    processados++;
+    if (!x.ok) { erro = x.erro; if (x.status === 401 || x.status === 403) break; continue; }
+    vendas += x.qtd; total = r2(total + x.total); novas.push(...x.novas);
+  }
+  return { processados, faltam: Math.max(0, fila.length - processados), erro, vendas, total, novas, ate: fim, de: ini };
+}
+async function rotinaStoneVendas() {
+  const x = await sincStoneVendas(4, 8, true);
+  if (x.novas.length) {
+    const tot = r2(x.novas.reduce((s, v) => s + v.valor, 0));
+    const dias = [...new Set(x.novas.map((v) => v.data))].sort().map((d) => d.split("-").reverse().slice(0, 2).join("/"));
+    const titulo = x.novas.length === 1 ? "1 venda no cartão (Stone)" : `${x.novas.length} vendas no cartão (Stone)`;
+    await q(db.from("fin_notificacoes").insert({ banco: "stone_vendas", titulo, texto: `Total ${brl(tot).replace("+", "")} · ${dias.join(", ")}`,
+      dados: { itens: x.novas.slice(0, 50).map((v) => ({ id: v.id, data: v.data, valor: v.valor, descricao: v.descricao })) } }));
+    await log("auto", titulo);
+  }
+  if (x.erro && !x.processados) throw new Erro(x.erro, 502);
+  return { arquivos: x.processados, novas: x.novas.length, faltam: x.faltam, erro: x.erro };
 }
 
 // Um banco na rotina automática: busca, grava (upsert, nunca apaga) e avisa o que ainda não estava gravado
@@ -381,7 +480,7 @@ async function rotina() {
   const res: Record<string, unknown> = {};
   for (const c of await credenciais()) {
     if (!c.completo) { res[c.banco] = "não configurado"; continue; }
-    try { res[c.banco] = await rotinaBanco(c.banco); }
+    try { res[c.banco] = c.banco === "stone_vendas" ? await rotinaStoneVendas() : await rotinaBanco(c.banco); }
     catch (e) {
       const m = e instanceof Error ? e.message : String(e);
       await log("auto", `Atualização automática (${NOME[c.banco]}) falhou: ${m}`);
@@ -495,8 +594,13 @@ Deno.serve(async (req) => {
           upd.agencia = a || null;
         }
         if (b.conta !== undefined) {
-          const c = banco === "bradesco" ? txt(b.conta, 20).replace(/\D/g, "") : txt(b.conta, 60);
+          let c = banco === "bradesco" ? txt(b.conta, 20).replace(/\D/g, "") : txt(b.conta, 60);
           must(banco !== "bradesco" || !c || c.length <= 7, "Conta: até 7 números, sem o dígito.", 400);
+          if (banco === "stone_vendas") {
+            const codes = [...new Set(txt(b.conta, 200).split(/[,;\s]+/).map((x) => x.replace(/\D/g, "")).filter(Boolean))];
+            must(codes.every((x) => x.length >= 6 && x.length <= 15), "StoneCode: só números (de 6 a 15). Mais de um? Separe por vírgula.", 400);
+            c = codes.join(",");
+          }
           upd.conta = c || null;
         }
         const sec = (b.segredos && typeof b.segredos === "object") ? b.segredos : {};
@@ -534,7 +638,21 @@ Deno.serve(async (req) => {
         if (!c.completo) {
           const o = OBRIG[banco];
           const falta = [...o.campos.filter((k) => !(c as any)[k]), ...o.segredos.filter((k) => !c.segredos.includes(k))];
-          ok = false; msg = "Falta preencher: " + falta.map((k) => ({ client_id: "Client ID", agencia: "agência", conta: "conta", client_secret: "Client Secret", cert: "certificado (.pfx)", chave_privada: "chave privada (.pem)" } as any)[k] || k).join(", ") + ".";
+          ok = false; msg = "Falta preencher: " + falta.map((k) => ({ client_id: "Client ID", agencia: "agência", conta: "conta", client_secret: "Client Secret", cert: "certificado (.pfx)", chave_privada: "chave privada (.pem)", chave: "chave da API de Conciliação" } as any)[k] || k).join(", ") + ".";
+        } else if (banco === "stone_vendas") {
+          try {
+            const cr = await stoneVendasCred();
+            const partes: string[] = [];
+            ok = true;
+            for (const sc of cr.codes) {
+              // tenta o último dia pronto e, se não houver arquivo, os anteriores
+              let x: any = null, d = ultimoDiaPronto();
+              for (let i = 0; i < 3; i++, d = somaDias(d, -1)) { x = await processaDiaStone(sc, cr.chave, d); if (x.ok || x.status === 401 || x.status === 403) break; }
+              if (x.ok) partes.push(`StoneCode ${sc}: arquivo de ${d.split("-").reverse().join("/")} com ${x.qtd} venda${x.qtd === 1 ? "" : "s"} no cartão (${brl(x.total).replace("+", "")})`);
+              else { ok = false; partes.push(`StoneCode ${sc}: ${x.erro}`); }
+            }
+            msg = (ok ? "Conexão OK. " : "") + partes.join(" · ") + (ok ? ". Use “Sincronizar vendas” para buscar os dias anteriores." : "");
+          } catch (e) { ok = false; msg = e instanceof Error ? e.message : String(e); }
         } else if (banco === "bradesco") {
           const cr = await bradCred();
           const x = await bradesco(cr, new Date(Date.now() - 6 * 864e5), new Date());
@@ -579,6 +697,16 @@ Deno.serve(async (req) => {
         must(admin, "Só administradores sincronizam o extrato.");
         const banco = BANCOS.includes(b.banco) ? b.banco : "bradesco";
         const dias = Math.min(365, Math.max(1, Number(b.dias) || 90));
+        if (banco === "stone_vendas") {
+          const x = await sincStoneVendas(dias, 12);
+          if (x.erro && !x.vendas && x.processados <= 1) throw new Erro(x.erro, 502);
+          const feitos = await q(db.from("fin_stone_arquivos").select("ok,vendas").gte("data", x.de).lte("data", x.ate));
+          const okd = feitos.filter((f: any) => f.ok);
+          const msg = `Vendas no cartão: ${okd.length} dia(s) baixados de ${x.de.split("-").reverse().join("/")} a ${x.ate.split("-").reverse().join("/")}, ${okd.reduce((s: number, f: any) => s + (f.vendas || 0), 0)} vendas.${x.faltam ? ` Faltam ${x.faltam} dia(s).` : ""}`;
+          await q(db.from("fin_credenciais").update({ teste_em: new Date().toISOString(), teste_ok: true, teste_msg: msg + (x.erro ? ` Último erro: ${x.erro}` : "") }).eq("banco", "stone_vendas"));
+          if (!x.faltam) await log(me.login, `${me.nome} sincronizou as vendas no cartão Stone (${dias} dias)`);
+          return out({ ok: true, n: x.vendas, faltam: x.faltam, processados: x.processados, erro: x.erro });
+        }
         const x = await buscaBanco(banco, dias - 1);
         if (x.saldo) await gravaSaldo(banco, x.conta, x.saldo);
         for (let i = 0; i < x.rows.length; i += 500) await q(db.from("fin_lancamentos").upsert(x.rows.slice(i, i + 500)));

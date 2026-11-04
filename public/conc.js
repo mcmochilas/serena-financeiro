@@ -21,6 +21,8 @@ const C = {
 const sinal = (v) => (v > 0 ? '+' : v < 0 ? '−' : '') + brl.format(Math.abs(v));
 const dDia = (iso) => { const p = String(iso).slice(0, 10).split('-'); return `${+p[2]}/${p[1]}`; };
 const ehAdmin = () => S.me && S.me.role === 'admin';
+const BK = { bradesco: 'Bradesco', stone: 'Stone', stone_vendas: 'Stone cartão' };
+const bk = (b) => h('span', { class: 'bk ' + (b || '') }, BK[b] || b || '');
 // Redesenha só a tela de conciliação, parte por parte, sem tirar o foco de quem está digitando nos filtros
 function rr() {
   const root = document.querySelector('.body.cc');
@@ -116,7 +118,7 @@ function resumoConc() {
     t('Pré-vendas no período', int.format(r.qtd), brl.format(r.valor)),
     t('Conciliadas', `${int.format(r.conc_qtd)}`, `${brl.format(r.conc_valor)} · ${pct}%`, h('div', { class: 'cc-prog', role: 'progressbar', 'aria-valuenow': pct, 'aria-valuemin': 0, 'aria-valuemax': 100 }, h('i', { style: `width:${pct}%` })), 'ok'),
     t('Pendentes', int.format(r.pend_qtd), brl.format(r.pend_valor), null, r.pend_qtd ? 'warn' : ''),
-    t('Recebimentos sem pré-venda', int.format(r.receb_soltos_qtd), `${brl.format(r.receb_soltos_valor)} em PIX, TED e boletos de clientes`));
+    t('Recebimentos sem pré-venda', int.format(r.receb_soltos_qtd), `${brl.format(r.receb_soltos_valor)} em PIX, TED, boletos e cartão`));
 }
 
 function filtrosConc() {
@@ -227,7 +229,7 @@ function blocoConciliada(c) {
     h('div', { class: 'cc-selo' }, h('span', { class: 'ic' }, '✓'), h('div', {}, h('b', {}, 'Conciliada'), h('div', { class: 's' }, `em ${quando(c.criado)} por ${c.por}`))),
     c.pedidos_det?.length > 1 ? h('div', { class: 'cc-sub' }, h('h3', {}, 'Pré-vendas juntas'), c.pedidos_det.map((x) => h('div', { class: 'cc-linha' }, h('span', {}, `${x.id} · ${x.cliente}`), h('b', {}, brl.format(Number(x.total)))))) : null,
     h('div', { class: 'cc-sub' }, h('h3', {}, c.recebimentos.length === 1 ? 'Recebimento' : `${c.recebimentos.length} recebimentos`),
-      c.recebimentos.map((r) => h('div', { class: 'cc-linha' }, h('span', {}, h('span', { class: 'bk ' + (r.banco || '') }, r.banco === 'stone' ? 'Stone' : 'Bradesco'), ` ${dDia(r.data)} · ${r.pagador || r.descricao}`), h('b', {}, brl.format(r.valor))))),
+      c.recebimentos.map((r) => h('div', { class: 'cc-linha' }, h('span', {}, bk(r.banco), ` ${dDia(r.data)} · ${r.pagador || r.descricao}`), h('b', {}, brl.format(r.valor))))),
     h('div', { class: 'cc-conta' },
       h('div', {}, h('span', {}, 'Pré-venda'), h('b', {}, brl.format(c.total_pedidos))),
       h('div', {}, h('span', {}, 'Recebido'), h('b', {}, brl.format(c.total_pagos))),
@@ -265,7 +267,7 @@ function blocoSugestoes(d, p) {
       h('span', { class: 'chk', 'aria-hidden': 'true' }, on ? '✓' : ''),
       h('span', { class: 'cc-cv' }, h('b', {}, brl.format(c.valor)), chipV),
       h('span', { class: 'cc-cp' }, h('b', {}, c.pagador || c.descricao), h('span', { class: 's' },
-        h('span', { class: 'bk ' + c.banco }, c.banco === 'stone' ? 'Stone' : 'Bradesco'), ` ${dDia(c.data)}`, c.dias ? ` · ${c.dias > 0 ? c.dias + 'd depois' : -c.dias + 'd antes'}` : ' · mesmo dia')),
+        bk(c.banco), ` ${dDia(c.data)}`, c.dias ? ` · ${c.dias > 0 ? c.dias + 'd depois' : -c.dias + 'd antes'}` : ' · mesmo dia')),
       h('span', { class: 'cc-cs' }, h('span', { class: 'pill ' + c.nivel }, nivelTxt(c.nivel)),
         h('span', { class: 'bar', title: `Pontuação ${c.score} de 100` }, h('i', { style: `width:${c.score}%` })),
         h('span', { class: 'mot' }, c.motivos.filter((m) => m !== 'Valor exato').join(' · ')))));

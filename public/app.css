@@ -286,3 +286,4 @@ table.tb { width: 100%; border-collapse: collapse; font-size: var(--cap); font-v
 .cc-selo .s { font-size: 12px; opacity: .85; }
 .cc-sub { display: flex; flex-direction: column; gap: 6px; }
 .cc-obs { font-size: var(--cap); color: var(--muted); margin: 0; }
+.bk.stone_vendas { background: #E3F5EC; color: #13804B; }

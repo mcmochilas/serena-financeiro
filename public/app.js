@@ -160,7 +160,21 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) chec
 
 async function sincronizar(btn, dias, banco = S.banco) {
   const t = btn.textContent; btn.disabled = true; btn.textContent = 'Sincronizando…';
-  try { const r = await api('sync', { dias, banco }); S.ext = null; S.cred = null; toast(`${r.n} lançamentos sincronizados.`); render(); }
+  try {
+    if (banco === 'stone_vendas') {
+      // um arquivo por dia: baixa em lotes até não faltar nenhum
+      let r, vendas = 0, voltas = 0;
+      do {
+        r = await api('sync', { dias, banco });
+        vendas += r.n || 0; voltas++;
+        if (r.faltam) btn.textContent = `Baixando… faltam ${r.faltam} dia${r.faltam === 1 ? '' : 's'}`;
+      } while (r.faltam && r.processados && voltas < 40);
+      S.cred = null; render();
+      toast(`${vendas} vendas no cartão baixadas da Stone.${r.erro ? ' Atenção: ' + r.erro : ''}`, !!r.erro && !vendas);
+      return;
+    }
+    const r = await api('sync', { dias, banco }); S.ext = null; S.cred = null; toast(`${r.n} lançamentos sincronizados.`); render();
+  }
   catch (e) { toast(e.message, true); btn.disabled = false; btn.textContent = t; }
 }
 
@@ -414,6 +428,12 @@ const BANCO_UI = {
     campos: [['client_id', 'Client ID', 'text', 'Enviado pela Stone por e-mail depois do cadastro da aplicação'], ['conta', 'ID da conta (opcional)', 'text', 'Deixe em branco: é preenchido sozinho no primeiro teste de conexão']],
     segredos: [['chave_privada', 'Chave privada (.pem)', 'pem', 'Só se você já gerou o par por conta própria. Se não, use “Gerar par de chaves” abaixo.']],
   },
+  stone_vendas: {
+    nome: 'Stone · Vendas no cartão', sub: 'API de Conciliação Stone · vendas na maquininha e no link de pagamento, uma vez por dia', semAmbiente: true,
+    campos: [['conta', 'StoneCode', 'text', 'O número que aparece no seletor “Stonecode” do portal. Mais de um? Separe por vírgula.']],
+    segredos: [['chave', 'Chave da API de Conciliação', 'password', 'Portal Stone › Chaves de autenticação › aba “Plataforma de e-commerce / Conciliação” › Criar chave']],
+    rodape: 'O arquivo de vendas de cada dia fica pronto na Stone depois das 5h do dia seguinte. As vendas entram na Conciliação como recebimentos (cartão e link de pagamento) e são atualizadas sozinhas todo dia.',
+  },
 };
 function painelApis() {
   const p = h('section', { class: 'panel' }, h('h2', {}, 'APIs'),
@@ -451,7 +471,8 @@ function cardBanco(c, admin) {
   salvar.onclick = async () => {
     salvar.disabled = true; msg.className = 'msg'; msg.textContent = 'Salvando…';
     try {
-      const body = { banco: c.banco, ambiente: ambiente.value, segredos: {} };
+      const body = { banco: c.banco, segredos: {} };
+      if (!ui.semAmbiente) body.ambiente = ambiente.value;
       for (const k of Object.keys(ins)) body[k] = ins[k].value;
       for (const [k, el] of Object.entries(sec)) {
         if (el.dataset.pem) { const f = el.files[0]; if (f) { if (f.size > 20000) throw new Error('Esse arquivo não parece uma chave .pem.'); body.segredos[k] = await f.text(); } }
@@ -480,11 +501,12 @@ function cardBanco(c, admin) {
   return h('div', { class: 'card', id: 'api-' + c.banco },
     h('div', { class: 'api-h' }, h('div', {}, h('h3', {}, ui.nome), h('p', {}, ui.sub)),
       h('span', { class: 'badge ' + (c.completo ? 'on' : 'off') }, c.completo ? 'Configurado' : 'Não configurado')),
-    h('div', { class: 'fields' }, h('label', { class: 'field' }, 'Ambiente', ambiente), campos, segredos),
+    h('div', { class: 'fields' }, ui.semAmbiente ? null : h('label', { class: 'field' }, 'Ambiente', ambiente), campos, segredos),
+    ui.rodape ? h('p', { class: 'hint', style: 'margin:10px 0 0' }, ui.rodape) : null,
     c.banco === 'stone' ? blocoChaveStone(c, admin) : null,
     ro ? h('p', { class: 'meta' }, 'Só administradores podem alterar as credenciais.') : null,
     h('div', { class: 'actions' }, salvar, testar,
-      admin && c.completo ? h('button', { class: 'btn sec', type: 'button', onclick: (ev) => sincronizar(ev.currentTarget, 90, c.banco) }, 'Sincronizar extrato') : null,
+      admin && c.completo ? h('button', { class: 'btn sec', type: 'button', onclick: (ev) => sincronizar(ev.currentTarget, 90, c.banco) }, c.banco === 'stone_vendas' ? 'Sincronizar vendas (90 dias)' : 'Sincronizar extrato') : null,
       apagar),
     h('p', { class: 'meta', style: 'word-break:break-word;line-height:1.5' }, msg),
     c.atualizado ? h('p', { class: 'meta' }, `Última alteração em ${quando(c.atualizado)} por ${c.atualizado_por}.`) : null);
