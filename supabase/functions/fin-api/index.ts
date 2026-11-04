@@ -18,12 +18,12 @@ type Me = { login: string; nome: string; role: string };
 const BANCOS = ["bradesco", "stone"] as const;
 // segredos aceitos por banco (nunca voltam para a tela)
 const SEGREDOS: Record<string, string[]> = {
-  bradesco: ["client_secret"],
+  bradesco: ["client_secret", "cert", "cert_senha"],
   stone: ["api_key"],
 };
 // o que precisa estar preenchido para considerar o banco configurado
 const OBRIG: Record<string, { campos: string[]; segredos: string[] }> = {
-  bradesco: { campos: ["client_id"], segredos: ["client_secret"] },
+  bradesco: { campos: ["client_id", "agencia", "conta"], segredos: ["client_secret", "cert"] },
   stone: { campos: ["client_id"], segredos: ["api_key"] },
 };
 
@@ -42,7 +42,7 @@ function resumoCred(c: any) {
   const o = OBRIG[c.banco];
   const completo = o.campos.every((k) => c[k]) && o.segredos.every((k) => tem.includes(k));
   return {
-    banco: c.banco, ambiente: c.ambiente, client_id: c.client_id || "", conta: c.conta || "", cert_nome: c.cert_nome || "",
+    banco: c.banco, ambiente: c.ambiente, client_id: c.client_id || "", agencia: c.agencia || "", conta: c.conta || "", cert_nome: c.cert_nome || "",
     segredos: tem, completo, atualizado: c.atualizado, atualizado_por: c.atualizado_por,
     teste_em: c.teste_em, teste_ok: c.teste_ok, teste_msg: c.teste_msg,
   };
@@ -96,7 +96,16 @@ Deno.serve(async (req) => {
         const upd: Record<string, unknown> = { atualizado: new Date().toISOString(), atualizado_por: me.login, teste_em: null, teste_ok: null, teste_msg: null };
         if (b.ambiente !== undefined) { must(["sandbox", "producao"].includes(b.ambiente), "Ambiente inválido.", 400); upd.ambiente = b.ambiente; }
         if (b.client_id !== undefined) upd.client_id = txt(b.client_id, 300) || null;
-        if (b.conta !== undefined) upd.conta = txt(b.conta, 60) || null;
+        if (b.agencia !== undefined) {
+          const a = txt(b.agencia, 10).replace(/\D/g, "");
+          must(!a || a.length <= 4, "Agência: até 4 números, sem o dígito.", 400);
+          upd.agencia = a || null;
+        }
+        if (b.conta !== undefined) {
+          const c = banco === "bradesco" ? txt(b.conta, 20).replace(/\D/g, "") : txt(b.conta, 60);
+          must(banco !== "bradesco" || !c || c.length <= 7, "Conta: até 7 números, sem o dígito.", 400);
+          upd.conta = c || null;
+        }
         const sec = (b.segredos && typeof b.segredos === "object") ? b.segredos : {};
         const mudou: string[] = [];
         for (const [nome, valor] of Object.entries(sec)) {
@@ -125,7 +134,7 @@ Deno.serve(async (req) => {
         if (!c.completo) {
           const o = OBRIG[banco];
           const falta = [...o.campos.filter((k) => !(c as any)[k]), ...o.segredos.filter((k) => !c.segredos.includes(k))];
-          ok = false; msg = "Falta preencher: " + falta.map((k) => ({ client_id: "Client ID", client_secret: "Client Secret", cert: "certificado", api_key: "chave privada" } as any)[k] || k).join(", ") + ".";
+          ok = false; msg = "Falta preencher: " + falta.map((k) => ({ client_id: "Client ID", agencia: "agência", conta: "conta", client_secret: "Client Secret", cert: "certificado", api_key: "chave privada" } as any)[k] || k).join(", ") + ".";
         } else {
           ok = null;
           msg = "Credenciais completas e guardadas com segurança. A conexão com o banco é ativada na próxima etapa, junto com a sincronização do extrato.";
@@ -140,7 +149,7 @@ Deno.serve(async (req) => {
         must(BANCOS.includes(banco as any), "Banco inválido.", 400);
         const c = await q(db.from("fin_credenciais").select("secrets").eq("banco", banco).single());
         for (const nome of Object.keys(c.secrets || {})) await q(db.rpc("fin_secret_put", { p_banco: banco, p_nome: nome, p_valor: "" }));
-        await q(db.from("fin_credenciais").update({ client_id: null, conta: null, cert_nome: null, secrets: {}, atualizado: new Date().toISOString(), atualizado_por: me.login, teste_em: null, teste_ok: null, teste_msg: null }).eq("banco", banco));
+        await q(db.from("fin_credenciais").update({ client_id: null, agencia: null, conta: null, cert_nome: null, secrets: {}, atualizado: new Date().toISOString(), atualizado_por: me.login, teste_em: null, teste_ok: null, teste_msg: null }).eq("banco", banco));
         await log(me.login, `${me.nome} apagou as credenciais ${banco}`);
         return out({ bancos: await credenciais() });
       }
