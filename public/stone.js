@@ -75,7 +75,12 @@ function telaStoneVendas() {
     h('div', { class: 'seg', role: 'group', 'aria-label': 'Origem' },
       [['todas', 'Todas'], ['maquininha', 'Maquininha'], ['link', 'Link de pagamento']].map(([k, t]) => h('button', { type: 'button', 'aria-pressed': String(SV.origem === k), onclick: () => { SV.origem = k; SV.pagina = 1; svRedesenha(); } }, t, h('small', {}, ` ${nOrig(k)}`)))),
     busca,
-    h('span', { class: 'sv-ult' }, info.ultimo_arquivo ? `Arquivo mais recente: ${diaAno(info.ultimo_arquivo)}` : '')));
+    h('span', { class: 'sv-ult' }, info.ultimo_arquivo ? `Vendas até ${diaAno(info.ultimo_arquivo)}` : '')));
+  // a Stone só gera o arquivo de um dia depois que ele termina: as vendas de hoje entram amanhã de manhã
+  const hoje = svIso(0);
+  if (info.ultimo_arquivo && info.ultimo_arquivo < hoje) wrap.append(h('div', { class: 'info sv-hoje' },
+    h('b', {}, `Vendas de ${diaAno(hoje)}: `), 'a Stone só libera o arquivo de vendas depois que o dia termina. As vendas de hoje entram sozinhas amanhã, a partir das 6h, e o sininho avisa quando chegarem.',
+    info.conta_ok ? '' : ' Os pagamentos por link (cartão e Pix) vão aparecer na hora quando a Conta Stone estiver conectada.'));
 
   // tabela
   const lista = svFiltradas();
