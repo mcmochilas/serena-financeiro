@@ -5,7 +5,6 @@
 const https = require('https');
 const crypto = require('crypto');
 const forge = require('node-forge');
-const tls = require('tls');
 
 // Lê o .pfx (chave + certificado) e monta a cadeia completa do certificado: muitos .pfx exportados
 // no Windows não trazem as ACs intermediárias, e sem elas o Bradesco não reconhece o certificado.
@@ -116,15 +115,6 @@ module.exports = async (req, res) => {
     return;
   }
   const tj = json(t.texto);
-  if (t.status !== 200 || !tj || !tj.access_token) {
-    // diagnóstico: registra no log da Vercel o handshake TLS (mostra se o banco pediu o certificado)
-    await new Promise((ok) => {
-      const host = new URL(BASE[amb]).hostname;
-      const sk = tls.connect({ host, port: 443, servername: host, key: cad.key, cert: cad.cert, minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2', enableTrace: true }, () => { console.log('[diag] handshake ok; authorized=', sk.authorized); sk.end(); ok(); });
-      sk.on('error', (e) => { console.log('[diag] erro', e.message); ok(); });
-      setTimeout(ok, 10000);
-    });
-  }
   if (t.status !== 200 || !tj || !tj.access_token) {
     res.status(200).json({ etapa: 'token', ok: false, status: t.status, texto: curto(t.texto) || '(sem corpo)', tls: { ...(t.tls || {}), cadeia: cad.info.cadeia, no_pfx: cad.info.no_pfx, no_pfx_nomes: cad.info.no_pfx_nomes, baixadas: cad.info.baixadas, serie: cad.info.serie, sha1: cad.info.sha1 } });
     return;
