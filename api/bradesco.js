@@ -20,11 +20,15 @@ async function cadeia(pfxB64, senha) {
   const folha = certs.find((c) => pub(c) === chavePub) || certs[0];
   if (!folha) throw new Error('o arquivo não tem o certificado');
   const nome = (c) => (c.subject.getField('CN') || {}).value || '';
-  const auto = (c) => c.isIssuer(c);
-  const chain = [folha], baixadas = [];
+  const dn = (x) => x.attributes.map((a) => `${a.type}=${a.value}`).join(',');
+  const fp = (c) => forge.md.sha1.create().update(forge.asn1.toDer(forge.pki.certificateToAsn1(c)).getBytes()).digest().toHex();
+  const assina = (pai, filho) => { try { return pai.verify(filho); } catch { return false; } };
+  const auto = (c) => dn(c.subject) === dn(c.issuer);
+  const chain = [folha], vistos = new Set([fp(folha)]), baixadas = [];
   let atual = folha;
   for (let i = 0; i < 5 && !auto(atual); i++) {
-    let pai = certs.find((c) => c !== atual && c.isIssuer(atual));
+    const cands = certs.filter((c) => !vistos.has(fp(c)) && dn(c.subject) === dn(atual.issuer));
+    let pai = cands.find((c) => assina(c, atual)) || cands[0];
     if (!pai) {
       const aia = (atual.getExtension('authorityInfoAccess') || {}).value || '';
       const url = (String(aia).match(/https?:\/\/[\x21-\x7e]+?\.(?:crt|cer|p7b|p7c|der)/i) || [])[0];
@@ -36,17 +40,18 @@ async function cadeia(pfxB64, senha) {
         try { achados = [forge.pki.certificateFromAsn1(forge.asn1.fromDer(der))]; }
         catch { try { achados = forge.pkcs7.messageFromAsn1(forge.asn1.fromDer(der)).certificates || []; } catch { achados = []; } }
         if (!achados.length && /BEGIN CERT/.test(der)) achados = [forge.pki.certificateFromPem(der)];
-        pai = achados.find((c) => { try { return c.verify(atual); } catch { return false; } }) || achados[0];
+        achados = achados.filter((c) => !vistos.has(fp(c)) && dn(c.subject) === dn(atual.issuer));
+        pai = achados.find((c) => assina(c, atual)) || achados[0];
         if (pai) baixadas.push(nome(pai));
       } catch { break; }
     }
-    if (!pai || auto(pai)) break; // raiz não precisa ir na conexão
-    chain.push(pai); atual = pai;
+    if (!pai || auto(pai)) break; // a raiz não precisa ir na conexão
+    chain.push(pai); vistos.add(fp(pai)); atual = pai;
   }
   return {
     key: forge.pki.privateKeyToPem(key),
     cert: chain.map((c) => forge.pki.certificateToPem(c)).join('\n'),
-    info: { titular: nome(folha), cadeia: chain.map(nome), no_pfx: certs.length, baixadas, validade: folha.validity.notAfter.toISOString().slice(0, 10) },
+    info: { titular: nome(folha), cadeia: chain.map(nome), no_pfx: certs.length, no_pfx_nomes: certs.map(nome), baixadas, serie: folha.serialNumber, sha1: fp(folha).toUpperCase(), validade: folha.validity.notAfter.toISOString().slice(0, 10) },
   };
 }
 
@@ -111,7 +116,7 @@ module.exports = async (req, res) => {
   }
   const tj = json(t.texto);
   if (t.status !== 200 || !tj || !tj.access_token) {
-    res.status(200).json({ etapa: 'token', ok: false, status: t.status, texto: curto(t.texto) || '(sem corpo)', tls: { ...(t.tls || {}), cadeia: cad.info.cadeia, no_pfx: cad.info.no_pfx, baixadas: cad.info.baixadas } });
+    res.status(200).json({ etapa: 'token', ok: false, status: t.status, texto: curto(t.texto) || '(sem corpo)', tls: { ...(t.tls || {}), cadeia: cad.info.cadeia, no_pfx: cad.info.no_pfx, no_pfx_nomes: cad.info.no_pfx_nomes, baixadas: cad.info.baixadas, serie: cad.info.serie, sha1: cad.info.sha1 } });
     return;
   }
   if (b.so_token) { res.status(200).json({ etapa: 'token', ok: true, via: TOKEN[amb] }); return; }

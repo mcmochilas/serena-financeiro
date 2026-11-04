@@ -74,7 +74,7 @@ function explica(x: any) {
   if (x.etapa === "certificado") return x.texto;
   if (x.etapa === "token") {
     const c = x.tls;
-    const cad = c?.cadeia?.length ? `; cadeia enviada: ${c.cadeia.join(" → ")} (no arquivo: ${c.no_pfx}${c.baixadas?.length ? `; baixadas: ${c.baixadas.join(", ")}` : ""})` : "";
+    const cad = c?.cadeia?.length ? `; cadeia enviada: ${c.cadeia.join(" → ")} (no arquivo .pfx: ${(c.no_pfx_nomes || []).join(", ") || c.no_pfx}${c.baixadas?.length ? `; baixadas: ${c.baixadas.join(", ")}` : ""}); impressão digital SHA-1 ${c.sha1 || "?"}` : "";
     const diag = c ? ` [conexão ${c.versao || "?"}; certificado ${c.enviado ? `enviado: ${c.titular} (emissor ${c.emissor}, válido até ${c.validade})` : "NÃO enviado"}${cad}]` : "";
     return `O Bradesco não liberou o acesso (token): HTTP ${x.status} ${x.texto}${diag}`;
   }
