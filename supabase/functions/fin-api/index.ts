@@ -52,14 +52,15 @@ const credenciais = async () => (await q(db.from("fin_credenciais").select("*").
 
 // ---------- Bradesco: API de Saldo e Extrato (manual v2.2.2) ----------
 const BRAD = {
-  producao: { base: "https://openapi.bradesco.com.br", tokens: ["/auth/server-mtls/v2/token", "/auth/server/v1.1/token"] },
-  sandbox: { base: "https://openapisandbox.prebanco.com.br", tokens: ["/auth/server-mtls/v2/token", "/auth/server/v1.1/token"] },
+  // endereços de token conforme a collection oficial "Saldo e extrato | cliente"
+  producao: { base: "https://openapi.bradesco.com.br", tokens: ["/auth/server-mtls/v1/token"] },
+  sandbox: { base: "https://openapisandbox.prebanco.com.br", tokens: ["/auth/server-mtls/v2/token"] },
 } as const;
 const curto = (s: string, n = 220) => s.replace(/\s+/g, " ").slice(0, n);
 async function bradToken(amb: "producao" | "sandbox", id: string, secret: string) {
   const cfg = BRAD[amb], tentativas: string[] = [];
   for (const path of cfg.tokens) {
-    for (const modo of ["basic", "corpo"]) {
+    for (const modo of ["corpo", "basic"]) {
       const body = new URLSearchParams({ grant_type: "client_credentials" });
       const headers: Record<string, string> = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" };
       if (modo === "basic") headers.Authorization = "Basic " + btoa(`${id}:${secret}`);
@@ -80,8 +81,10 @@ async function bradToken(amb: "producao" | "sandbox", id: string, secret: string
 const ddmmaaaa = (d: Date) => `${String(d.getUTCDate()).padStart(2, "0")}${String(d.getUTCMonth() + 1).padStart(2, "0")}${d.getUTCFullYear()}`;
 async function bradExtrato(amb: "producao" | "sandbox", token: string, agencia: string, conta: string, ini: Date, fim: Date) {
   const u = new URL(BRAD[amb].base + "/v1/fornecimento-extratos-contas/extratos");
-  u.search = new URLSearchParams({ agencia, conta, dataInicio: ddmmaaaa(ini), dataFim: ddmmaaaa(fim), tipo: "cc", tipoOperacao: "1" }).toString();
-  const r = await fetch(u, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }, signal: AbortSignal.timeout(30000) });
+  u.search = new URLSearchParams({ agencia, conta, tipo: "cc", dataInicio: ddmmaaaa(ini), dataFim: ddmmaaaa(fim) }).toString();
+  let r = await fetch(u, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }, signal: AbortSignal.timeout(30000) });
+  // a collection manda o token sem o prefixo Bearer: tenta assim se o banco recusar
+  if (r.status === 401 || r.status === 403) r = await fetch(u, { headers: { Authorization: token, Accept: "application/json" }, signal: AbortSignal.timeout(30000) });
   const txt = await r.text();
   let j: any = null; try { j = JSON.parse(txt); } catch { /* texto */ }
   return { status: r.status, json: j, texto: curto(txt, 400) };
