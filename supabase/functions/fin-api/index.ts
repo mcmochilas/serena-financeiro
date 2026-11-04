@@ -18,12 +18,12 @@ type Me = { login: string; nome: string; role: string };
 const BANCOS = ["bradesco", "stone"] as const;
 // segredos aceitos por banco (nunca voltam para a tela)
 const SEGREDOS: Record<string, string[]> = {
-  bradesco: ["client_secret", "cert", "cert_senha"],
+  bradesco: ["client_secret"],
   stone: ["api_key"],
 };
 // o que precisa estar preenchido para considerar o banco configurado
 const OBRIG: Record<string, { campos: string[]; segredos: string[] }> = {
-  bradesco: { campos: ["client_id"], segredos: ["client_secret", "cert"] },
+  bradesco: { campos: ["client_id"], segredos: ["client_secret"] },
   stone: { campos: ["client_id"], segredos: ["api_key"] },
 };
 
