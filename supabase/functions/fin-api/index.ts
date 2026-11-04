@@ -74,7 +74,8 @@ function explica(x: any) {
   if (x.etapa === "certificado") return x.texto;
   if (x.etapa === "token") {
     const c = x.tls;
-    const diag = c ? ` [conexão ${c.versao || "?"}; certificado ${c.enviado ? `enviado: ${c.titular} (emissor ${c.emissor}, válido até ${c.validade})` : "NÃO enviado"}]` : "";
+    const cad = c?.cadeia?.length ? `; cadeia enviada: ${c.cadeia.join(" → ")} (no arquivo: ${c.no_pfx}${c.baixadas?.length ? `; baixadas: ${c.baixadas.join(", ")}` : ""})` : "";
+    const diag = c ? ` [conexão ${c.versao || "?"}; certificado ${c.enviado ? `enviado: ${c.titular} (emissor ${c.emissor}, válido até ${c.validade})` : "NÃO enviado"}${cad}]` : "";
     return `O Bradesco não liberou o acesso (token): HTTP ${x.status} ${x.texto}${diag}`;
   }
   if (x.etapa === "extrato") return `Acesso liberado, mas a consulta do extrato voltou HTTP ${x.status}: ${x.texto}`;

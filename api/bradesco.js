@@ -3,8 +3,52 @@
 // Recebe as credenciais já descriptografadas do cofre, apresenta o certificado da empresa na
 // conexão (mTLS), pede o token e consulta o extrato. Nada é gravado nem registrado aqui.
 const https = require('https');
-const tls = require('tls');
 const crypto = require('crypto');
+const forge = require('node-forge');
+
+// Lê o .pfx (chave + certificado) e monta a cadeia completa do certificado: muitos .pfx exportados
+// no Windows não trazem as ACs intermediárias, e sem elas o Bradesco não reconhece o certificado.
+// As intermediárias que faltarem são baixadas do endereço público que o próprio certificado indica (AIA).
+async function cadeia(pfxB64, senha) {
+  const p12 = forge.pkcs12.pkcs12FromAsn1(forge.asn1.fromDer(forge.util.decode64(pfxB64)), false, senha || '');
+  const bag = (t) => (p12.getBags({ bagType: t })[t] || []);
+  const key = [...bag(forge.pki.oids.pkcs8ShroudedKeyBag), ...bag(forge.pki.oids.keyBag)].map((b) => b.key).find(Boolean);
+  if (!key) throw new Error('o arquivo não tem a chave privada');
+  const certs = bag(forge.pki.oids.certBag).map((b) => b.cert).filter(Boolean);
+  const pub = (c) => forge.pki.publicKeyToPem(c.publicKey);
+  const chavePub = forge.pki.publicKeyToPem(forge.pki.rsa.setPublicKey(key.n, key.e));
+  const folha = certs.find((c) => pub(c) === chavePub) || certs[0];
+  if (!folha) throw new Error('o arquivo não tem o certificado');
+  const nome = (c) => (c.subject.getField('CN') || {}).value || '';
+  const auto = (c) => c.isIssuer(c);
+  const chain = [folha], baixadas = [];
+  let atual = folha;
+  for (let i = 0; i < 5 && !auto(atual); i++) {
+    let pai = certs.find((c) => c !== atual && c.isIssuer(atual));
+    if (!pai) {
+      const aia = (atual.getExtension('authorityInfoAccess') || {}).value || '';
+      const url = (String(aia).match(/https?:\/\/[\x21-\x7e]+?\.(?:crt|cer|p7b|p7c|der)/i) || [])[0];
+      if (!url) break;
+      try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        const der = Buffer.from(await r.arrayBuffer()).toString('binary');
+        let achados = [];
+        try { achados = [forge.pki.certificateFromAsn1(forge.asn1.fromDer(der))]; }
+        catch { try { achados = forge.pkcs7.messageFromAsn1(forge.asn1.fromDer(der)).certificates || []; } catch { achados = []; } }
+        if (!achados.length && /BEGIN CERT/.test(der)) achados = [forge.pki.certificateFromPem(der)];
+        pai = achados.find((c) => { try { return c.verify(atual); } catch { return false; } }) || achados[0];
+        if (pai) baixadas.push(nome(pai));
+      } catch { break; }
+    }
+    if (!pai || auto(pai)) break; // raiz não precisa ir na conexão
+    chain.push(pai); atual = pai;
+  }
+  return {
+    key: forge.pki.privateKeyToPem(key),
+    cert: chain.map((c) => forge.pki.certificateToPem(c)).join('\n'),
+    info: { titular: nome(folha), cadeia: chain.map(nome), no_pfx: certs.length, baixadas, validade: folha.validity.notAfter.toISOString().slice(0, 10) },
+  };
+}
 
 const BASE = { producao: 'https://openapi.bradesco.com.br', sandbox: 'https://openapisandbox.prebanco.com.br' };
 const TOKEN = { producao: '/auth/server-mtls/v1/token', sandbox: '/auth/server-mtls/v2/token' };
@@ -43,14 +87,13 @@ module.exports = async (req, res) => {
   const amb = b.amb === 'sandbox' ? 'sandbox' : 'producao';
   if (!b.client_id || !b.client_secret || !b.pfx) { res.status(400).json({ erro: 'Faltam credenciais.' }); return; }
 
-  let agent;
-  const pfx = Buffer.from(String(b.pfx), 'base64'), passphrase = b.senha || undefined;
+  let agent, cad;
   try {
-    tls.createSecureContext({ pfx, passphrase }); // valida arquivo e senha antes de conectar
-    // TLS 1.2: o Bradesco pede o certificado no handshake (cifras ECDHE-RSA-AES-GCM do manual)
-    agent = new https.Agent({ pfx, passphrase, keepAlive: false, minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2' });
+    cad = await cadeia(String(b.pfx), b.senha || '');
+    // TLS 1.2 com a cadeia completa (certificado + ACs intermediárias)
+    agent = new https.Agent({ key: cad.key, cert: cad.cert, keepAlive: false, minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2' });
   } catch (e) {
-    const senha = /mac verify|bad decrypt|password/i.test(e.message);
+    const senha = /mac|password|decrypt|Invalid password/i.test(String(e.message));
     res.status(200).json({ etapa: 'certificado', ok: false, texto: senha ? 'A senha do certificado não confere.' : 'Não consegui abrir o certificado (' + curto(e.message, 120) + '). Envie o arquivo .pfx ou .p12.' });
     return;
   }
@@ -68,7 +111,7 @@ module.exports = async (req, res) => {
   }
   const tj = json(t.texto);
   if (t.status !== 200 || !tj || !tj.access_token) {
-    res.status(200).json({ etapa: 'token', ok: false, status: t.status, texto: curto(t.texto) || '(sem corpo)', tls: t.tls });
+    res.status(200).json({ etapa: 'token', ok: false, status: t.status, texto: curto(t.texto) || '(sem corpo)', tls: { ...(t.tls || {}), cadeia: cad.info.cadeia, no_pfx: cad.info.no_pfx, baixadas: cad.info.baixadas } });
     return;
   }
   if (b.so_token) { res.status(200).json({ etapa: 'token', ok: true, via: TOKEN[amb] }); return; }
