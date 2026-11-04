@@ -72,7 +72,11 @@ async function bradesco(cr: Awaited<ReturnType<typeof bradCred>>, ini: Date, fim
 }
 function explica(x: any) {
   if (x.etapa === "certificado") return x.texto;
-  if (x.etapa === "token") return `O Bradesco não liberou o acesso (token): HTTP ${x.status} ${x.texto}`;
+  if (x.etapa === "token") {
+    const c = x.tls;
+    const diag = c ? ` [conexão ${c.versao || "?"}; certificado ${c.enviado ? `enviado: ${c.titular} (emissor ${c.emissor}, válido até ${c.validade})` : "NÃO enviado"}]` : "";
+    return `O Bradesco não liberou o acesso (token): HTTP ${x.status} ${x.texto}${diag}`;
+  }
   if (x.etapa === "extrato") return `Acesso liberado, mas a consulta do extrato voltou HTTP ${x.status}: ${x.texto}`;
   return x.texto || "Falha desconhecida.";
 }

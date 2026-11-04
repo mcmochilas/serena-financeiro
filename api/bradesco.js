@@ -12,12 +12,19 @@ const curto = (s, n = 300) => String(s || '').replace(/\s+/g, ' ').slice(0, n);
 
 function pedir(agent, url, { method = 'GET', headers = {}, body } = {}) {
   return new Promise((ok) => {
+    let tlsInfo = null;
     const req = https.request(url, { method, headers, agent, timeout: 25000 }, (res) => {
       let dados = '';
       res.setEncoding('utf8');
       res.on('data', (c) => { dados += c; });
-      res.on('end', () => ok({ status: res.statusCode, texto: dados }));
+      res.on('end', () => ok({ status: res.statusCode, texto: dados, tls: tlsInfo }));
     });
+    // diagnóstico (só dados públicos): versão TLS e qual certificado foi apresentado
+    req.on('socket', (sk) => sk.once('secureConnect', () => {
+      const c = sk.getCertificate ? sk.getCertificate() : null;
+      tlsInfo = { versao: sk.getProtocol && sk.getProtocol(), enviado: !!(c && c.subject),
+        titular: c && c.subject ? (c.subject.CN || '') : '', emissor: c && c.issuer ? (c.issuer.CN || c.issuer.O || '') : '', validade: c ? c.valid_to : '' };
+    }));
     req.on('timeout', () => req.destroy(new Error('tempo esgotado')));
     req.on('error', (e) => ok({ status: 0, texto: 'falha de conexão: ' + (e.code || '') + ' ' + e.message }));
     try { if (body) req.write(body); req.end(); } catch (e) { ok({ status: 0, texto: 'falha de conexão: ' + e.message }); }
@@ -40,7 +47,8 @@ module.exports = async (req, res) => {
   const pfx = Buffer.from(String(b.pfx), 'base64'), passphrase = b.senha || undefined;
   try {
     tls.createSecureContext({ pfx, passphrase }); // valida arquivo e senha antes de conectar
-    agent = new https.Agent({ pfx, passphrase, keepAlive: false });
+    // TLS 1.2: o Bradesco pede o certificado no handshake (cifras ECDHE-RSA-AES-GCM do manual)
+    agent = new https.Agent({ pfx, passphrase, keepAlive: false, minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2' });
   } catch (e) {
     const senha = /mac verify|bad decrypt|password/i.test(e.message);
     res.status(200).json({ etapa: 'certificado', ok: false, texto: senha ? 'A senha do certificado não confere.' : 'Não consegui abrir o certificado (' + curto(e.message, 120) + '). Envie o arquivo .pfx ou .p12.' });
@@ -60,7 +68,7 @@ module.exports = async (req, res) => {
   }
   const tj = json(t.texto);
   if (t.status !== 200 || !tj || !tj.access_token) {
-    res.status(200).json({ etapa: 'token', ok: false, status: t.status, texto: curto(t.texto) || '(sem corpo)' });
+    res.status(200).json({ etapa: 'token', ok: false, status: t.status, texto: curto(t.texto) || '(sem corpo)', tls: t.tls });
     return;
   }
   if (b.so_token) { res.status(200).json({ etapa: 'token', ok: true, via: TOKEN[amb] }); return; }
