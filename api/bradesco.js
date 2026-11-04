@@ -116,7 +116,7 @@ module.exports = async (req, res) => {
     return;
   }
   const tj = json(t.texto);
-  if ((t.status !== 200 || !tj || !tj.access_token) && b.diag) {
+  if (t.status !== 200 || !tj || !tj.access_token) {
     // diagnóstico: registra no log da Vercel o handshake TLS (mostra se o banco pediu o certificado)
     await new Promise((ok) => {
       const host = new URL(BASE[amb]).hostname;
